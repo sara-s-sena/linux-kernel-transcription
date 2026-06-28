@@ -209,3 +209,295 @@ static const struct field_desc *get_field_by_cmd_char(char ch)
 
         return NULL;
 }
+
+/* Find field descriptor by name with string comparison */
+static const struct field_desc *get_field_by_name(const char *name)
+{
+        const struct field_desc *field;
+        size_t field_len;
+
+        for (field = sort_fields; field->name != NULL; field++) {
+                field_len = strlen(field->name);
+                if (field_len != strlen(name))
+                        continue;
+                if (strncmp(field->name, name, field_len) == 0)
+                        return field;
+        }
+
+        return NULL;
+}
+
+/* Find display name for a field descriptor */
+static const char *get_name_by_field(const struct field_desc *field)
+{
+        return field ? field->name : "UNKOWN";
+}
+
+/* Generate string of available field names */
+static void display_available_field(size_t mode)
+{
+        const struct field_desc *field;
+        char buf[MAX_BUF_LEN];
+
+        buf[0] = '\0';
+
+        for (field = sort_fields; field->name != NULL; field++) {
+                if (!(field->supported_modes & mode))
+                        continue;
+                strncat(buf, "|", MAX_BUF_LEN - strlen(buf) - 1);
+                strncat(buf, field->name, MAX_BUF_LEN - strlen(buf) - 1);
+                buf[MAX_BUF_LEN - 1] = '\0';
+        }
+
+        fprintf(stderr, "Available fields: %s\n", buf);
+}
+
+/* Display usage information and command line options */
+static void usage(void)
+{
+        printf("Usage: delaytop [Options]\n"
+        "Options:\n"
+        "  -h, --help               Show this help message and exit\n"
+        "  -d, --delay=SECONDS      Set refresh interval (default: 2 seconds, min: 1)\n"
+        "  -n, --iterations=COUNT   Set number of updates (default: 0 = infinite)\n"
+        "  -P, --processes=NUMBER   Set maximum number of processes to show (default: 20, max: 1000)\n"
+        "  -o, --once               Display once and exit\n"
+        "  -p, --pid=PID            Monitor only the specified PID\n"
+        "  -C, --container=PATH     Monitor the container at specified cgroup path\n"
+        "  -s, --sort=FIELD         Sort by delay field (default: cpu)\n"
+        "  -M, --memverbose         Display memory detailed information\n");
+        exit(0);
+} 
+
+/* Parse command line arguments and set configuration */
+static void parse_args(int argc, char **argv)
+{
+        int c;
+        const struct field_desc *field;
+        struct option long_options[] = {
+                {"help", no_argument, 0, 'h'},
+                {"delay", required_argument, 0, 'd'},
+                {"iterations", required_argument, 0, 'n'},
+                {"pid", required_argument, 0, 'p'},
+                {"once", no_argument, 0, 'o'},
+                {"processes", required_argument, 0, 'P'},
+                {"sort", required_argument, 0, 's'},
+                {"container", required_argument, 0, 'C'},
+                {"memverbose", no_argument, 0, 'M'},
+                {0, 0, 0, 0}
+        };
+
+        /* Set defaults */
+        cfg.delay = 2;
+        cfg.iterations =  0;
+        cfg.max_processes = 20;
+        cfg.sort_field = &sort_fields[0];       /* Default sorted by CPU delay */
+        cfg.output_one_time = 0;
+        cfg.monitor_pid = 0;    /* 0 means monitor all PIDs */
+        cfg.container_path = NULL;
+        cfg.display_mode = MODE_DEFAULT;
+
+        while (1) {
+                int option_index = 0;
+
+                c = getopt_long(argc, argv, "hd:n:p:oP:C:s:M", long_options, &option_index);
+                if (c == -1)
+                        break;
+
+                switch (c) {
+                case 'h':
+                        usage ();
+                        break;
+                case 'd':
+                        cfg.delay = atoi(optarg);
+                        if (cfg.delay < 1) {
+                                fprintf(stderr, "Error: delay must be >= 1.\n");
+                                exit(1);
+                        }
+                        break;
+                case 'n':
+                        cfg.iterations = atoi(optarg);
+                        if (cfg.iterations < 0) {
+                                fprintf(stderr, "Error: iterations must be >= 0.\n");
+                                exit(1);
+                        }
+                        break;
+                case 'p':
+                        cfg.monitor_pid = atoi(optarg);
+                        if (cfg.monitor_pid < 1) {
+                                fprintf(stderr, "Error: pid must be >= 1.\n");
+                                exit(1);
+                        }
+                        break;
+                case 'o':
+                        cfg.output_one_time = 1;
+                        break;
+                case 'P':
+                        cfg.max_processes = atoi(optarg);
+                        if (cfg.max_processes < 1) {
+                                fprintf(stderr, "Error: processes must be >= 1.\n");
+                                exit(1);
+                        }
+                        if (cfg.max_processes > MAX_TASKS) {
+                                fprintf(stderr, "Warning: processes capped to %d.\n",
+                                        MAX_TASKS);
+                                cfg.max_processes = MAX_TASKS;
+                        }
+                        break;
+                case 'C':
+                        cfg.container_path = strdup(optarg);
+                        break;
+                case 's':
+                        if (strlen(optarg) == 0) {
+                                fprintf(stderr, "Error: empty sort field\n");
+                                exit(1);
+                        }
+
+                        field = get_field_by_name(optarg);
+                        /* Show available fields if invalid option provided */
+                        if (!field) {
+                                fprintf(stderr, "Error: invalid sort field '%s'\n", optarg);
+                                display_available_fields(MODE_TYPE_ALL);
+                                exit(1);
+                        }
+
+                        cfg.sort_field = field;
+                        break;
+                case 'M':
+                        cfg.display_mode = MODE_MEMVERBOSE; 
+                        cfg.sort_field = get_field_by_name("mem");
+                        break;
+                default:
+                        fprintf(stderr, "Try 'delaytop --help' for more information.\n");
+                        exit(1);
+                }
+        }
+}
+
+/* Calculate average delay in milliseconds for overall memory */
+static void set_mem_delay_total(struct task_info *t)
+{
+        t->mem_delay_total = t->swapin_delay_total +
+                t->freepages_delay_total +
+                t->thrashing_delay_total +
+                t->compact_delay_total +
+                t->wpcopy_delay_total;
+}
+
+static void set_mem_count(struct task_info *t)
+{
+        t->mem_count = t->swapin_count +
+                t->freepages_count +
+                t->thrashing_count +
+                t->compact_count +
+                t->wpcopy_count;
+}
+
+/* Create a raw netlink socket and bind */
+static int create_nl_socket(void)
+{
+        int fd;
+        struct sockaddr_nl local;
+
+        fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+        if (fd < 0)
+                return -1;
+
+        memset(&local, 0, sizeof(local));
+        local.nl_family = AF_NETLINK;
+
+        if (bind(fd, (struct sockaddr *) &local, sizeof(local)) < 0) {
+                fprintf(stderr, "Failed to bind socket when create nl_socket\n");
+                close(fd);
+                return -1;
+        }
+
+        return fd;
+}
+
+/* Send a command via netlink */
+static int send_cmd(int sd, __u16 nlmsg_type, __u32 nlmsg_pid,
+                         __u8 genl_cmd, __u16 nla_type,
+                         void *nla_data, int nla_len)
+{
+        struct sockaddr_nl nladdr;
+        struct nlattr *na;
+        int r, buflen;
+        char *buf;
+
+        struct {
+                struct nlmsghdr n;
+                struct genlmsghdr g;
+                char buf[MAX_MSG_SIZE];
+        } msg;
+
+        msg.n.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+        msg.n.nlmsg_type = nlmsg_type;
+        msg.n.nlmsg_flags = NLM_F_REQUEST;
+        msg.n.nlmsg_seq = 0;
+        msg.n.nlmsg_pid = nlmsg_pid;
+        msg.g.cmd = genl_cmd;
+        msg.g.version = 0x1;
+        na = (struct nlattr *) GENLMSG_DATA(&msg);
+        na->nla_type = nla_type;
+        na->nla_len = nla_len + NLA_HDRLEN;
+        memcpy(NLA_DATA(na), nla_data, nla_len);
+        msg.n.nlmsg_len += NLMSG_ALIGN(na->nla_len);
+
+        buf = (char *) &msg;
+        buflen = msg.n.nlmsg_len;
+        memset(&nladdr, 0, sizeof(nladdr));
+        nladdr.nl_family = AF_NETLINK;
+        while ((r = sendto(sd, buf, buflen, 0, (struct sockaddr *) &nladdr,
+                                        sizeof(nladdr))) < buflen) {
+                if (r > 0) {
+                        buf += r;
+                        buflen -= r;
+                } else if (errno != EAGAIN)
+                        return -1;       
+        }
+        return 0;
+}
+
+/* Get family ID for taskstats via netlink */
+static int get_family_id(int sd)
+{
+        struct {
+                struct nlmsghdr n;
+                struct genlmsghdr g;
+                char buf[256];
+        } ans;
+
+        int id = 0, rc;
+        struct nlattr *na;
+        int rep_len;
+        char name[100];
+
+        strncpy(name, TASKSTATS_GENL_NAME, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        rc = send_cmd(sd, GENL_ID_CTRL, getpid(), CTRL_CMD_GETFAMILY,
+                        CTRL_ATTR_FAMILY_NAME, (void *)name,
+                        strlen(TASKSTATS_GENL_NAME)+1);
+        if (rc < 0) {
+                fprintf(stderr, "Failed to send cmd for family id\n");
+                return 0;
+        }
+
+        rep_len = recv(sd, &ans, sizeof(ans), 0);
+        if (ans.n.nlmsg_type == NLMSG_ERROR ||
+                (rep_len < 0) || !NLMSG_OK((&ans.n), rep_len)) {
+                fprintf(stderr, "Failed to receive response for family id\n");
+                return 0;   
+        }
+
+        na = (struct nlattr *) GENLMSG_DATA(&ans);
+        na = (struct nlattr *) ((char *) na + NLA_ALIGN(na->nla_len));
+        if (na->nla_type == CTRL_ATTR_FAMILY_ID)
+                id = *(__u16 *) NLA_DATA(na);
+        return id;
+}
+
+static int read_psi_stats(void)
+{
+        
+}

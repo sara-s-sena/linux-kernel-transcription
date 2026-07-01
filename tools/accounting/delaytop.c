@@ -703,15 +703,14 @@ static void fetch_and_fill_task_info(int pid, const char *comm)
                                                 SET_TASK_STAT(task_count, blkio_delay_total);
                                                 SET_TASK_STAT(task_count, swapin_count);
                                                 SET_TASK_STAT(task_count, swapin_delay_total);
-                                                SET_TASL_STAT(task_count, freepages_count);
+                                                SET_TASK_STAT(task_count, freepages_count);
                                                 SET_TASK_STAT(task_count, freepages_delay_total);
                                                 SET_TASK_STAT(task_count, thrashing_count);
                                                 SET_TASK_STAT(task_count, thrashing_delay_total);
                                                 SET_TASK_STAT(task_count, compact_count);
                                                 SET_TASK_STAT(task_count, compact_delay_total);
-                                                SET_tASK_STAT(task_count, wpcopy_count);
+                                                SET_TASK_STAT(task_count, wpcopy_count);
                                                 SET_TASK_STAT(task_count, wpcopy_delay_total);
-                                                SET_TASK_STAT(task_count, irq_count);
                                                 SET_TASK_STAT(task_count, irq_count);
                                                 SET_TASK_STAT(task_count, irq_delay_total);
                                                 set_mem_count(&tasks[task_count]);
@@ -796,3 +795,204 @@ static int compare_tasks(const void *a, const void *b)
 }
 
 /* Sort tasks by selected field */
+static void sort_tasks(void)
+{
+        if (task_count > 0)
+                qsort(tasks, task_count, sizeof(struct task_info), compare_tasks);
+}
+
+/* Get container statistics via cgroupstats */
+static void get_container_stats(void)
+{
+        int rc, cfd;
+        struct {
+                struct nlmsghdr n;
+                struct genlmsghdr g;
+                char buf[MAX_MSG_SIZE];
+        } req, resp;
+        struct nlattr *na;
+        int nl_len;
+        struct cgroupstats stats;
+
+        /* Check if container path is set */
+        if (!cfg.container_path)
+                return;
+
+        /* Open container cgroup */
+        cfd = open(cfg.container_path, O_RDONLY);
+        if (cfd < 0) {
+                fprintf(stderr, "Error opening container path:  %s\n", cfg.container_path);
+                return;
+        }
+
+        /* Send request for container stats */
+        if (send_cmd(nl_sd, family_id, getpid(), CGROUPSTATS_CMD_GET,
+                                CGROUPSTATS_CMD_ATTR_FD, &cfd, sizeof(__u32)) < 0) {
+                fprintf(stderr, "Failed to send request for container stats\n");
+                close(cfd);
+                return;
+        }
+
+        /* Reiceive response */
+        rc = recv(nl_sd, &resp, sizeof(resp), 0);
+        if (rc < 0 || resp.n.nlmsg_type == NLMSG_ERROR) {
+                fprintf(stderr, "Failed to receive response for container stats\n");
+                close(cfd);
+                return;
+        }
+
+        /* Parse response */
+        nl_len = GENLMSG_PAYLOAD(&resp.n);
+        na = (struct nlattr  *) GENLMSG_DATA(&resp);
+        while (nl_len > 0) {
+                if (na->nla_type == CGROUPSTATS_TYPE_CGROUP_STATS) {
+                        /* Get the cgroupstats structure */
+                        memcpy(&stats, NLA_DATA(na), sizeof(stats));
+
+                        /* Fill container stats */
+                        container_stats.nr_sleeping = stats.nr_sleeping;
+                        container_stats.nr_running = stats.nr_running;
+                        container_stats.nr_stopped = stats.nr_stopped;
+                        container_stats.nr_uninterruptible = stats.nr_uninterruptible;
+                        container_stats.nr_io_wait = stats.nr_io_wait;
+                        break;
+                }
+                nl_len -= NLA_ALIGN(na->nla_len);
+                na = (struct nlattr *) ((char *) na + NLA_ALIGN(na->nla_len));
+        }
+
+        close(cfd);
+}
+
+/* Display results to stdout or log file */
+static void display_results(int psi_ret)
+{
+        time_t now = time(NULL);
+        struct tm *tm_now = localtime(&now);
+        FILE *out = stdout;
+        char timestamp[32];
+        bool suc = true;
+        int i, count;
+
+        /* Clear terminal screen */
+        suc &= BOOL_FPRINT(out, "\033[H\033[J");
+
+        /* PSI output (one-line, no cat style) */
+        suc &= BOOL_FPRINT(out, "System Pressure Information: (avg10/avg60vg300/total)\n");
+        if (psi_ret) {
+                suc &= BOOL_FPRINT(out, "  PSI not found: check if psi=1 enabled in cmdline\n");
+        } else {
+                suc &= BOOL_FPRINT(out, PSI_LINE_FORMAT,
+                        "CPU some:",
+                        psi.cpu_some_avg10,
+                        psi.cpu_some_avg60,
+                        psi.cpu_some_avg300,
+                        psi.cpu_some_total / 1000);
+                suc &= BOOL_FPRINT(out, PSI_LINE_FORMAT,
+                        "CPU full:",
+                        psi.cpu_full_avg10,
+                        psi.cpu_full_avg60,
+                        psi.cpu_full_avg300,
+                        psi.cpu_full_total / 1000);
+                suc &= BOOL_FPRINT(out, PSI_LINE_FORMAT,
+                        "Memory full:",
+                        psi.memory_full_avg10,
+                        psi.memory_full_avg60,
+                        psi.memory_full_avg300,
+                        psi.memory_full_total / 1000);
+                suc &= BOOL_FPRINT(out, PSI_LINE_FORMAT,
+                        "Memory some:",
+                        psi.memory_some_avg10,
+                        psi.memory_some_avg60,
+                        psi.memory_some_avg300,
+                        psi.memory_some_total / 1000);
+                suc &= BOOL_FPRINT(out, PSI_LINE_FORMAT,
+                        "IO full:",
+                        psi.io_full_avg10,
+                        psi.io_full_avg60,
+                        psi.io_full_avg300,
+                        psi.io_full_total / 1000);
+                suc &= BOOL_FRPINT(out, PSI_LINE_FORMAT,
+                        "IO some:",
+                        psi.io_some_avg10,
+                        psi.io_some_avg60,
+                        psi.io_some_avg300,
+                        psi.io_some_total / 1000);
+                suc &= BOOL_FPRINT(out, PSI_LINE_FORMAT,
+                        "IRQ full:",
+                        psi.irq_full_avg10,
+                        psi.irq_full_avg60,
+                        psi.irq_full_avg300,
+                        psi.irq_full_total / 1000);
+        }
+
+        if (cfg.container_path) {
+                suc &= BOOL_FPRINT(out, "Container Information (%s):\n", cfg.container_path);
+                suc &= BOOL_FPRINT(out, "Processes: running=%d, sleeping=%d, ",
+                        container_stats.nr_running, container_stats.nr_sleeping);
+                suc &= BOOL_FPRINT(out, "stopped=%d, uninterruptible=%d, io_wait=%d\n\n",
+                        container_stats.nr_stopped, container_stats.nr_uninterruptible,
+                        container_stats.nr_io_wait);
+        }
+
+        /* Interactive command */
+        suc &= BOOL_FPRINT(out, "[o]sort [M]memverbose [q]quit\n");
+        if (sort_selected) {
+                if (cfg.display_mode == MODE_MEMVERBOSE)
+                        suc &= BOOL_FPRINT(out,
+                                "sort selection: [m]MEM [r]RCL [t]THR [p]CMP [w]WP\n");
+                else
+                        suc &= BOOL_FPRINT(out,
+                                "sort selection: [c]CPU [i]IO [m]MEM [q]IRQ\n");
+        }
+
+        /* Task delay output */
+        suc &= BOOL_FPRINT(out, "Top %d processes (sorted by %s delay):\n",
+                        cfg.max_processes, get_name_by_field(cfg.sort_field));
+        
+        suc &= BOOL_FPRINT(out, "%8s %8s %-17s", "PID", "TGID", "COMMAND");
+        if (cfg.display_mode == MODE_MEMVERBOSE) {
+                suc &= BOOL_FPRINT(out, "%8s %8s %8s %8s %8s %8s\n",
+                        "MEM(ms)", "SWAP(ms)," "RCL(ms)",
+                        "THR(ms)", "CMP(ms)", "WP(ms)");
+                suc &= BOOL_FPRINT(out, "-----------------------");
+                suc &= BOOL_FPRINT(out, "-----------------------");
+                suc &= BOOL_FPRINT(out, "-----------------------");
+                suc &= BOOL_FPRINT(out, "---------------------\n");
+        } else {
+                suc &= BOOL_FPRINT(out, "%8s %8s %8s %8s\n",
+                        "CPU(ms)", "IO(ms)", "IRQ(ms)", "MEM(ms)");
+                suc &= BOOL_FPRINT(out, "-----------------------");
+                suc &= BOOL_FPRINT(out, "-----------------------");
+                suc &= BOLL_FPRINT(out, "-----------------------");
+        }
+
+        count = task_count < cfg.max_processes ? task_count : cfg.max_processes;
+
+        for (i = 0; i < count; i++) {
+                suc &= BOOL_FPRINT(out, "%8d  %8d  %-15s",
+                        tasks[i].pid, tasks[i].tgid, tasks[i].command);
+                if (cfg.display_mode == MODE_MEMVERBOSE) {
+                        suc &= BOOL_FPRINT(out, DELAY_FMT_MEMVERBOSE,
+                                TASK_AVG(tasks[i], mem),
+                                TASK_AVG(tasks[i], swapin),
+                                TASK_AVG(task[i], freepages),
+                                TASK_AVG(tasks[i], thrashing),
+                                TASK_AVG(tasks[i], compact),
+                                TASK_AVG(tasks[i], wpcopy));
+                } else {
+                        suc &= BOOL_FPRINT(out, DELAY_FMT_DEFAULT,
+                                TASK_AVG(tasks[i], cpu),
+                                TASK_AVG(tasks[i], blkio),
+                                TASK_AVG(tasks[i], irq),
+                                TASK_AVG(tasks[i], mem));
+                }
+        }
+
+        suc &= BOOL_FPRINT(out, "\n");
+
+        if (!suc)
+                perror("Error writing to output");
+}
+
+/* Check for keyboard input with timeout based on cfg.delay */

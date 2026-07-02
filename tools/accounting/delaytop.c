@@ -996,3 +996,150 @@ static void display_results(int psi_ret)
 }
 
 /* Check for keyboard input with timeout based on cfg.delay */
+static char check_for_keypress(void)
+{
+        struct timeval tv = {cfg.delay, 0};
+        fd_set readfds;
+        char ch = 0;
+
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+        int r = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv);
+
+        if (r > 0 && FD_ISSET(STDIN_FILENO, &readfds)) {
+                read(STDIN_FILENO, &ch, 1);
+                return ch;
+        }
+
+        return 0;
+}
+
+#define MAX_MODE_SIZE 2
+static void toggle_display_mode(void)
+{
+        static const size_t modes[MAX_MODE_SIZE] = {MODE_DEFAULT, MODE_MEMVERBOSE};
+        static size_t cur_index;
+
+        cur_index = (cur_index + 1) % MAX_MODE_SIZE;
+        cfg.display_mode = modes[cur_index];
+}
+
+/* Handle keyboard input: sorting selection, mode toggle, or quit */
+static void handle_keypress(char ch, int *running)
+{
+        const struct field_desc *field;
+
+        /* Change sort field */
+        if (sort_selected) {
+                field = get_field_by_cmd_char(ch);
+                if (field && (field->supported_modes & cfg.display_mode))
+                        cfg.sort_field = field;
+
+                sort_selected = 0;
+        /* Handle mode changes or quit */
+        } else {
+                switch (ch) {
+                case 'o':
+                        sort_selected = 1;
+                        break;
+                case 'M':
+                        toggle_display_mode();
+                        for (field = sort_fields; field->name != NULL; field++) {
+                                if (field->supported_modes & cfg.display_mode) {
+                                        cfg.sort_field = field;
+                                        break;
+                                }
+                        }
+                        break;
+                case 'q':
+                case 'Q':
+                        *running = 0;
+                        break;
+                default:
+                        break;
+                }
+        }
+}
+
+/* Main function */
+int main(int argc, char **argv)
+{
+        const struct field_desc *field;
+        int iterations = 0;
+        int psi_ret = 0;
+        char keypress;
+
+        /* Parse command line arguments */
+        parse_args(argc, argv);
+
+        /* Setup netlink socket */
+        nl_sd = create_nl_socket();
+        if (nl_sd < 0) {
+                fprintf(stderr, "Error creating netlink socket\n");
+                exit(1);
+        }
+
+        /* Get family ID for taskstats via netlink */
+        family_id = get_family_id(nl_sd);
+        if (!family_id) {
+                fprintf(stderr, "Error getting taskstats family ID\n");
+                close(nl_sd);
+                exit(1);
+        }
+
+        /* Set terminal to non-canonical mode for interaction */
+        enable_raw_mode();
+
+        /* Main loop */
+        while (running) {
+                /* Auto-switch sort field when not matching display mode */
+                if (!(cfg.sort_field->supported_modes & cfg.display_mode)) {
+                        for (field = sort_fields; field->name != NULL; field++) {
+                                if (field->supported_modes & cfg.display_mode) {
+                                        cfg.sort_field = field;
+                                        printf("Auto-switched sort field to: %s\n", field->name);
+                                        break;
+                                }
+                        }
+                }
+
+                /* Read PSI statistics */
+                psi_ret = read_psi_stats();
+
+                /* Get container stats if container path provided */
+                if (cfg.container_path)
+                        get_container_stats();
+
+                /* Get task delays */
+                get_task_delays();
+
+                /* Sort tasks */
+                sort_tasks();
+
+                /* Display results to stdout or log file */
+                display_results(psi_ret);
+
+                /* Check for iterations */
+                if (cfg.iterations > 0 && ++iterations >= cfg.iterations)
+                        break;
+
+                /* Exit if output_one_time is set */
+                if (cfg.output_one_time)
+                        break;
+
+                /* Keypress for interactive usage */
+                keypress = check_for_keypress();
+                if (keypress)
+                        handle_keypress(keypress, &running);
+        }
+
+        /* Restore terminal mode */
+        disable_raw_mode();
+
+        /* Cleanup */
+        close(nl_sd);
+        if (cfg.container_path)
+                free(cfg.container_path);
+
+                return 0;
+}

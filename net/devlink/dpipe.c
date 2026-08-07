@@ -192,3 +192,128 @@ nla_put_failure:
         return -EMSGSIZE;
 }
 
+static int devlink_dpipe_send_and_alloc_skb(struct sk_buff **pskb,
+                                            struct genl_info *info)
+{
+        int err;
+
+        if (*pskb) {
+                err = genlmsg_reply(*pskb, info);
+                if (err)
+                        return err;
+        }
+        *pskb = genlmsg_new(GENLMSG_DEFAULT_SIZE, GFP_KERNEL);
+        if (!*pskb)
+                return -ENOMEM;
+        return 0;
+}
+
+static int devlink_dpipe_tables_fill(struct genl_info *info,
+                                     enum devlink_command cmd, int flags,
+                                     struct list_head *dpipe_tables,
+                                     const char *table_name)
+{
+        struct devlink *devlink = info->user_ptr[0];
+        struct devlink_dpipe_table *table;
+        struct nlattr *tables_attr;
+        struct sk_buff *skb = NULL;
+        struct nlmsghdr *nlh;
+        bool incomplete;
+        void *hdr;
+        int i;
+        int err;
+
+        table = list_first_entry(dpipe_tables,
+                                 struct devlink_dpipe_table, list);
+start_again:
+        err = devlink_dpipe_send_and_alloc_skb(&skb, info);
+        if (err)
+                return err;
+
+        hdr = genlmsg_put(skb, info->snd_portid, info->snd_seq,
+                          &devlink_nl_family, NLM_F_MULTI, cmd);
+        if (!hdr) {
+                nlmsg_free(skb);
+                return -EMSGSIZE;
+        }
+
+        if (devlink_nl_put_handle(skb, devlink))
+                goto nla_put_failure;
+        tables_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_TABLES);
+        if (!tables_attr)
+                goto nla_put_failure;
+
+        i = 0;
+        incomplete = false;
+        list_for_each_entry_from(table, dpipe_tables, list) {
+                if (!table_name) {
+                        err = devlink_dpipe_table_put(skb, table);
+                        if (err) {
+                                if (!i)
+                                        goto err_table_put;
+                                incomplete = true;
+                                break;
+                        }
+                } else {
+                        if (!strcmp(table->name, table_name)) {
+                                err = devlink_dpipe_table_put(skb, table);
+                                if (err)
+                                        break;
+                        }
+                }
+                i++;
+        }
+
+        nla_nest_end(skb, tables_attr);
+        genlmsg_end(skb, hdr);
+        if (incomplete)
+                goto start_again;
+
+send_done:
+        nlh = nlmsg_put(skb, info->snd_portid, info->snd_seq,
+                        NLMSG_DONE, 0, flags | NLM_F_MULTI);
+        if (!nlh) {
+                err = devlink_dpipe_send_and_alloc_skb(&skb, info);
+                if (err)
+                        return err;
+                goto send_done;
+        }
+
+        return genlmsg_reply(skb, info);
+
+nla_put_failure:
+        err = -EMSGIZE;
+err_table_put:
+        nlmsg_free(skb);
+        return err;
+}
+
+int devlink_nl_dpipe_table_get_doit(struct sk_buff *skb, struct genl_info *info)
+{
+        struct devlink *devlink = info->user_ptr[0];
+        const char *table_name = NULL;
+
+        if (info->attrs[DEVLINK_ATTR_DPIPE_TABLE_NAME])
+                table_name = nla_data(info->attrs[DEVLINK_ATTR_DPIPE_TABLE_NAME]);
+
+        return devlink_dpipe_tables_fill(info, DEVLINK_CMD_DPIPE_TABLE_GET, 0,
+                                         &devlink->dpipe_table_list,
+                                         table_name);
+}
+
+static int devlink_dpipe_value_put(struct sk_buff *skb,
+                                   struct devlink_dpipe_value *value)
+{
+        if (nla_put(skb, DEVLINK_ATTR_DPIPE_VALUE,
+                    value->value_size, value->value))
+                return -EMSGSIZE;
+        if (value->mask)
+                if (nla_put(skb, DEVLINK_ATTR_DPIPE_VALUE_MASK,
+                            value->value_size, value->mask))
+                        return -EMSGSIZE;
+        if (value->mapping_valid)
+                if (nla_put_u32(skb, DEVLINK_ATTR_DPIPE_VALUE_MAPPING,
+                                value->mapping_value))
+                        return -EMSGSIZE;
+        return 0;
+}

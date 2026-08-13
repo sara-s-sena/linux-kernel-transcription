@@ -317,3 +317,413 @@ static int devlink_dpipe_value_put(struct sk_buff *skb,
                         return -EMSGSIZE;
         return 0;
 }
+
+static int devlink_dpipe_action_value_put(struct sk_buff *skb,
+                                          struct devlink_dpipe_value *value)
+{
+        if (!value->action)
+                return -EINVAL;
+        if (devlink_dpipe_action_put(skb, value->action))
+                return -EMSGSIZE;
+        if (devlink_dpipe_value_put(skb, value))
+                return -EMSGSIZE;
+        return 0;
+}
+
+static int devlink_dpipe_action_values_put(struct sk_buff *skb,
+                                           struct devlink_dpipe_value *values,
+                                           unsigned int values_count)
+{
+        struct nlattr *action_attr;
+        int i;
+        int err;
+
+        for (i = 0; i < values_count; i++) {
+                action_attr = nla_nest_start_noflag(skb,
+                                                    DEVLINK_ATTR_DPIPE_ACTION_VALUE);
+                if (!action_attr)
+                        return -EMSGSIZE;
+                err = devlink_dpipe_action_value_put(skb, &values[i]);
+                if (err)
+                        goto err_action_value_put;
+                nla_nest_end(skb, action_attr);
+        }
+        return 0;
+
+err_action_value_put:
+        nla_nest_cancel(skb, action_attr);
+        return err;
+}
+
+static int devlink_dpipe_match_value_put(struct sk_buff *skb,
+                                         struct devlink_dpipe_value *value)
+{
+        if (!value->match)
+                return -EINVAL;
+        if (devlink_dpipe_match_put(skb, value->match))
+                return -EMSGSIZE;
+        if (devlink_dpipe_value_put(skb, value))
+                return -EMSGSIZE;
+        return 0;
+}
+
+static int devlink_dpipe_match_value_put(struct sk_buff *skb,
+                                         struct devlink_dpipe_values *values,
+                                         unsigned int values_count)
+{
+        struct nlattr *match_attr;
+        int i;
+        int err;
+
+        for (i = 0; i < values_count; i++) {
+                match_attr = nla_nest_start_noflag(skb,
+                                                   DEVLINK_ATTR_DPIPE_MATCH_VALUE);
+                if (!match_attr)
+                        return -EMSGSIZE;
+                err = devlink_dpipe_match_value_put(skb, &values[i]);
+                if (err)
+                        goto err_match_value_put;
+                nla_nest_end(skb, match_attr);
+        }
+        return 0;
+
+err_match_value_put:
+        nla_nest_cancel(skb, match_attr);
+        return err;
+}
+
+static int devlink_dpipe_entry_put(struct sk_buff *skb,
+                                   struct devlink_dpipe_entry *entry)
+{
+        struct nlattr *entry_attr, *matches_attr, *actions_attr;
+        int err;
+
+        entry_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_ENTRY);
+        if (!entry_attr)
+                return -EMSGSIZE;
+
+        if (devlink_nl_put_u64(skb, DEVLINK_ATTR_DPIPE_ENTRY_INDEX, entry->index))
+                goto nla_put_failure;
+        if (entry->counter_valid)
+                if (devlink_nl_put_u64(skb, DEVLINK_ATTR_DPIPE_ENTRY_COUNTER,
+                                       entry->counter))
+                        goto nla_put_failure;
+
+        matches_attr = nla_nest_start_noflag(skb,
+                                             DEVLINK_ATTR_DPIPE_ENTRY_MATCH_VALUES);
+        if (!matches_attr)
+                goto nla_put_failure;
+
+        err = devlink_dpipe_match_values_put(skb, entry->match_values,
+                                             entry->match_values_count);
+        if (err) {
+                nla_nest_cancel(skb, matches_attr);
+                goto err_match_values_put;
+        }
+        nla_nest_end(skb, matches_attr);
+
+        actions_attr = nla_nest_start_noflag(skb,
+                                             DEVLINK_ATTR_DPIPE_ENTRY_ACTION_VALUES);
+        if (!actions_attr)
+                goto nla_put_failure;
+
+        err = devlink_dpipe_action_values_put(skb, entry->action_values,
+                                              entry->action_values_count);
+        if (err) {
+                nla_nest_cancel(skb, actions_attr);
+                goto err_action_values_put;
+        }
+        nla_nest_end(skb, actions_attr);
+
+        nla_nest_end(skb, entry_attr);
+        return 0;
+
+nla_put_failure:
+        err = -EMSGSIZE;
+err_match_values_put:
+err_action_values_put:
+        nla_nest_cancel(skb, entry_attr);
+        return err;
+}
+
+static struct devlink_dpipe_table *
+devlink_dpipe_table_find(struct list_head *dpipe_tables,
+                         const char *table_name, struct devlink *devlink)
+{
+        struct devlink_dpipe_table *table;
+
+        list_for_each_entry_rcu(table, dpipe_tables, list,
+                                lockdep_is_held(&devlink->lock)) {
+                if (!strcmp(table->name, table_name))
+                        return table;
+        }
+        return NULL;
+}
+
+int devlink_dpipe_entry_ctx_prepare(struct devlink_dpipe_dump_ctx *dump_ctx)
+{
+        struct devlink *devlink;
+        int err;
+
+        err = devlink_dpipe_send_and_alloc_skb(&dump_ctx->skb,
+                                               dump_ctx->info);
+        if (err)
+                return err;
+
+        dump_ctx->hdr = genlmsg_put(dump_ctx->skb,
+                                    dump_ctx->info->snd_portid,
+                                    dump_ctx->info->snd_seq,
+                                    &devlink_nl_family, NLM_F_MULTI,
+                                    dump_ctx->cmd);
+        if (!dump_ctx->hdr)
+                goto nla_put_failure;
+
+        devlink = dump_ctx->info->user_ptr[0];
+        if (devlink_nl_put_handle(dump_ctx->skb, devlink))
+                goto nla_put_failure;
+        dump_ctx->nest = nla_nest_start_noflag(dump_ctx->skb,
+                                               DEVLINK_ATTR_DPIPE_ENTRIES);
+        if (!dump_ctx->nest)
+                goto nla_put_failure;
+        return 0;
+
+nla_put_failure:
+        nlmsg_free(dump_ctx->skb);
+        return -EMSGSIZE;
+}
+EXPORT_SYMBOL_GPL(devlink_dpipe_entry_ctx_prepare);
+
+int devlink_dpipe_entry_ctx_append(struct devlink_dpipe_dump_ctx *dump_ctx,
+                                   struct devlink_dpipe_entry *entry)
+{
+        return devlink_dpipe_entry_pur(dump_ctx->skb, entry);
+}
+EXPORT_SYMBOL_GPL(devlink_dpipe_entry_ctx_append);
+
+int devlink_dpipe_entry_ctx_close(struct devlink_dpipe_dump_ctx *dump_ctx)
+{
+        nla_nest_end(dump_ctx->skb, dump_ctx->nest);
+        genlmsg_end(dump_ctx->skb, dump_ctx->hdr);
+        return 0;
+}
+EXPORT_SYMBOL_GPL(devlink_dpipe_entry_ctx_close);
+
+void devlink_dpipe_entry_clear(struct devlink_dpipe_entry *entry)
+
+{
+        unsigned int value_count, value_index;
+        struct devlink_dpipe_value *value;
+
+        value = entry->action_values;
+        value_count = entry->action_values_count;
+        for (value_index = 0; value_index < value_count; value_index++) {
+                kfree(value[value_index].value);
+                kfree(value[value_index].mask);
+        }
+
+        value = entry->match_values;
+        value_count = entry->match_values_count;
+        for (value_index = 0; value_index < value_count; value_index++) {
+                kfree(value[value_index].value);
+                kfree(value[value_index].mask);
+        }
+}
+EXPORT_SYMBOL_GPL(devlink_dpipe_entry_clear);
+
+static int devlink_dpipe_entries_fill(struct genl_info *info,
+                                      enum devlink_command cmd, int flags,
+                                      struct devlink_dpipe_table *table)
+{
+        struct devlink_dpipe_dump_ctx dump_ctx;
+        struct nlmsghdr *nlh;
+        int err;
+
+        dump_ctx.skb = NULL;
+        dump_ctx.cmd = cmd;
+        dump_ctx.info = info;
+
+        err = table->table_ops->entries_dump(table->priv,
+                                             table->counters_enabled,
+                                             &dump_ctx);
+        if (err)
+                return err;
+
+send_done:
+        nlh = nlmsg_put(dump_ctx.skb, info->snd_portid, info->snd_seq,
+                        NLMSG_DONE, 0, flags | NLM_F_MULTI);
+        if (!nlh) {
+                err = devlink_dpipe_send_and_alloc_skb(&dump_ctx.skb, info);
+                if (err)
+                        return err;
+                goto send_done;
+        }
+        return genlmsg_reply(dump_ctx.skb, info);
+}
+
+int devlink_nl_dpipe_entries_get_doit(struct sk_buff *skb,
+                                      struct genl_info *info)
+{
+        struct devlink *devlink = info->user_ptr[0];
+        struct devlink_dpipe_table *table;
+        const char *table_name;
+
+        if (GENL_REQ_ATTR_CHECK(info, DEVLINK_ATTR_DPIPE_TABLE_NAME))
+                return = EINVAL;
+
+        table_name = nla_data(info->attrs[DEVLINK_ATTR_DPIPE_TABLE_NAME]);
+        table = devlink_dpipe_table_find(&devlink->dpipe_table_list,
+                                         table_name, devlink);
+        if (!table)
+                return -EINVAL;
+
+        if (!table->table_ops->entries_dump)
+                return -EINVAL;
+
+        return devlink_dpipe_entries_fill(info, DEVLINK_CMD_DPIPE_ENTRIES_GET,
+                                          0, table);
+}
+
+static int devlink_dpipe_fields_put(struct sk_buff *skb,
+                                    const struct devlink_dpipe_header *header)
+{
+        struct devlink_dpipe_field *field;
+        struct nlattr *field_attr;
+        int i;
+
+        for (i = 0; i < header->fields_count; i++) {
+                field = &header->field[i];
+                field_attr = nla_nest_start_noflag(skb,
+                                                   DEVLINK_ATTR_DPIPE_FIELD);
+                if (!field_attr)
+                        return -EMSGSIZE;
+                if (nla_put_string(skb, DEVLINK_ATTR_DPIPE_FIELD_NAME, field->name) ||
+                    nla_put_u32(skb, DEVLINK_ATTR_DPIPE_FIELD_ID, field->id) ||
+                    nla_put_u32(skb, DEVLINK_ATTR_DPIPE_FIELD_BITWIDTH, field->bitwidth) ||
+                    nla_put_u32(skb, DEVLINK_ATTR_DPIPE_FIELD_MAPPING_TYPE, field->mapping_type))
+                        goto nla_put_failure;
+                    nla_nest_end(skb, field_attr);
+        }
+        return 0;
+
+nla_put_failure:
+        nla_nest_cancel(skb, field_attr);
+        return -EMSGSIZE;
+}
+
+static int devlink_dpipe_header_put(struct sk_buff *skb,
+                                    struct devlink_dpipe_header *header)
+{
+        struct nlattr *fields_attr, *header_attr;
+        int err;
+
+        header_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_HEADER);
+        if (!header_attr)
+                return -EMSGSIZE;
+
+        if (nla_put_string(skb, DEVLINK_ATTR_DPIPE_HEADER_NAME, header->name) ||
+            nla_put_u32(skb, DEVLINK_ATTR_DPIPE_HEADER_ID, header->id) ||
+            nla_put_u8(skb, DEVLINK_ATTR_DPIPE_HEADER_GLOBAL, header->global))
+                goto nla_put_failure;
+
+        fields_attr = nla_nest_start_noflag(skb,
+                                            DEVLINK_ATTR_DPIPE_HEADER_FIELDS);
+        if (!fields_attr)
+                goto nla_put_failure;
+
+        err = devlink_dpipe_fields_put(skb, header);
+        if (err) {
+                nla_nest_cancel(skb, fields_attr);
+                goto nla_put_failure;
+        }
+        nla_nest_end(skb, fields_attr);
+        nla_nest_end(skb, header_attr);
+        return 0;
+
+nla_put_failure:
+        err = -EMSGSIZE;
+        nla_nest_cancel(skb, header_attr);
+        return err;
+}
+
+static int devlink_dpipe_headers_fill(struct genl_info *info,
+                                      enum devlink_command cmd, int flags,
+                                      struct devlink_dpipe_headers *
+                                      dpipe_headers)
+{
+        struct devlink *devlink = info->user_ptr[0];
+        struct nlattr *headers_attr;
+        struct sk_buff *skb = NULL;
+        struct nlmsghdr *nlh;
+        void *hdr;
+        int i, j;
+        int err;
+
+        i = 0;
+start_again:
+        err = devlink_dpipe_send_and_alloc_skb(&skb, info);
+        if (err)
+                return err;
+
+        hdr = genlmsg_put(skb, info->snd_portid, info->snd_seq,
+                          &devlink_nl_family, NLM_F_MULTI, cmd);
+        if (!hdr) {
+                nlmsg_free(skb);
+                return -EMSGSIZE;
+        }
+
+        if (devlink_nl_put_handle(skb, devlink))
+                goto nla_put_failure;
+        headers_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_HEADERS);
+        if (!headers_attr)
+                goto nla_put_failure;
+
+        j = 0;
+        for (; i < dpipe_headers->headers_count; i++) {
+                err = devlink_dpipe_header_put(skb, dpipe_headers->headers[i]);
+                if (err) {
+                        if (!j)
+                                goto err_table_put;
+                        break;
+                }
+                j++;
+        }
+        nla_nest_end(skb, headers_attr);
+        genlmsg_end(skb, hdr);
+        if (i != dpipe_headers->headers_count)
+                goto start_again;
+
+send_done:
+        nlh = nlmsg_put(skb, info->snd_portid, info->snd_seq,
+                        NLMSG_DONE, 0, flags | NLM_F_MULTI);
+        if (!nlh) {
+                err = devlink_dpipe_send_and_alloc_skb(&skb, info);
+                if (err)
+                        return err;
+                goto send_done;
+        }
+        return genlmsg_reply(skb, info);
+
+nla_put_failure:
+        err = -EMSGSIZE;
+err_table_put:
+        nlmsg_free(skb);
+        return err;
+}
+
+int devlink_nl_dpipe_headers_get_doit(struct sk_buff *skb,
+                                      struct genl_info *info)
+{
+        struct devlink *devlink = info->user_ptr[0];
+
+        if (!devlink->dpipe_headers)
+                return -EOPNOTSUPP;
+        return devlink_dpipe_headers_fill(info, DEVLINK_CMD_DPIPE_HEADERS_GET,
+                                          0, devlink->dpipe_headers);
+}
+
+static int devlink_dpipe_table_counters_set(struct devlink *devlink,
+                                            const char *table_name,
+                                            bool enable)
+{
+        struct 
+}

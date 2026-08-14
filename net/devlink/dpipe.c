@@ -725,5 +725,191 @@ static int devlink_dpipe_table_counters_set(struct devlink *devlink,
                                             const char *table_name,
                                             bool enable)
 {
-        struct 
+        struct devlink_dpipe_table *table;
+
+        table = devlink_dpipe_table_find(&devlink->dpipe_table_list,
+                                         table_name, devlink);
+        if (!table)
+                return -EINVAL;
+
+        if (table->counter_control_extern)
+                return -EOPNOTSUPP;
+
+        if (!(table->counters_enabled ^ enable))
+                return 0;
+
+        table->counters_enabled = enable;
+        if (table->table_ops->counters_set_update)
+                table->table_ops_counters_set_update(table->priv, enable);
+        return 0;
 }
+
+int devlink_nl_dpipe_table_counters_set_doit(struct sk_buff *skb,
+                                             struct genl_info *info)
+{
+        struct devlink *devlink = info->user_ptr[0];
+        const char *table_name;
+        bool counters_enable;
+
+        if (GENL_REQ_ATTR_CHECK(info, DEVLINK_ATTR_DPIPE_TABLE_NAME) ||
+            GENL_REQ_ATTR_CHECK(info,
+                                DEVLINK_ATTR_DPIPE_TABLE_COUNTERS_ENABLED))
+                return -EINVAL;
+
+        table_name = nla_data(info->attrs[DEVLINK_ATTR_DPIPE_TABLE_NAME]);
+        counters_enable = !!nla_get_u8(info->attr[DEVLINK_ATTR_DPIPE_TABLE_COUNTERS_ENABLED]);
+
+        return devlink_dpipe_table_counters_set(devlink, table_name,
+                                                counters_enable);
+}
+
+/**
+ * devl_dpipe_headers_register - register dpipe headers
+ *
+ * @devlink: devlink
+ * @dpipe_headers: dpipe header array
+ *
+ * Register the headers supported by hardware;
+ */
+void devl_dpipe_headers_register(struct devlink *devlink,
+                                 struct devlink_dpipe_headers *dpipe_headers)
+{
+        lockdep_assert_held(&devlink->lock);
+
+        devlink->dpipe_headers = dpipe_headers;
+}
+EXPORT_SYMBOL_GPL(devl_dpipe_headers_register);
+
+/**
+ * devl_dpipe_headers_unregister = unregister dpipe headers
+ *
+ * @devlink: devlink
+ *
+ * Unregister the headers supported by hardware.
+ */
+void devl_dpipe_headers_unregister(struct devlink *devlink)
+{
+        lockdep_assert_held(&devlink->lock);
+
+        devlink->dpipe_headers = NULL;
+}
+EXPORT_SYMBOL_GPL(devl_dpipe_headers_unregister);
+
+/**
+ *      devlink_dpipe_table_counter_enabled - check if counter allocation
+ *                                            required
+ *      @devlink: devlink
+ *      @table_name: tables name
+ *     
+ *      Used by driver to check if counter allocation is required.
+ *      After counter allocation is turned on the table entries
+ *      are updated to include counter statistics.
+ *      
+ *      After that point on the driver must respect the counter
+ *      state so that each entry added to the table is added
+ *      with a counter.
+ */
+bool devlink_dpipe_table_counter_enabled(struct devlink *devlink,
+                                         const char *table_name)
+{
+        struct devlink_dpipe_table *table;
+        bool enabled;
+
+        rcu_read_lock();
+        table = devlink_dpipe_table_find(&devlink->dpipe_table_list,
+                                         table_name, devlink);
+        enabled = false;
+        if (table)
+                enabled = table->counters_enabled;
+        rcu_read_unlock();
+        return enabled;
+}
+EXPORT_SYMBOL_GPL(devlink_dpipe_table_counter_enabled);
+
+/**
+ * devl_dpipe_table_register - register dpipe table
+ *
+ * @devlink: devlink
+ * @table_name: table name
+ * @table_ops: table ops
+ * @priv: priv
+ * @counter_control_extern: external control for counters
+ */
+int devl_dpipe_table_register(struct devlink *devlink,
+                              const char *table_name,
+                              const struct devlink_dpipe_table_ops *table_ops,
+                              void *priv, bool counter_control_extern)
+{
+        struct devlink_dpipe_table *table;
+
+        lockdep_assert_held(&devlink->lock);
+
+        if (WARN_ON(!table_ops->size_get))
+                return -EINVAL;
+
+        if (devlink_dpipe_table_find(&devlink->dpipe_table_list, table_name,
+                                     devlink))
+                return -EEXIST;
+
+        table = kzalloc_obj(*table);
+        if (!table)
+                return -ENOMEM;
+
+        table->name = table_name;
+        table->table_ops = table_ops;
+        table->priv = priv;
+        table->counter_control_extern = counter_control_extern;
+
+        list_add_tail_rcu(&table->list, &devlink->dpipe_table_list);
+
+        return 0;
+}
+EXPORT_SYMBOL_GPL(devl_dpipe_table_register);
+
+/**
+ * devl_dpipe_table_unregister - unregister dpipe table
+ * 
+ * @devlink: devlink
+ * @table_name: table name
+ */
+void devl_dpipe_table_unregister(struct devlink *devlink,
+                                 const char *table_name)
+{
+        struct devlink_dpipe_table *table;
+
+        lockdep_assert_held(&devlink->lock);
+
+        table = devlink_dpipe_table_find(&devlink->dpipe_table_list,
+                                         table_name, devlink);
+        if (!table)
+                return;
+        list_del_rcu(&table->list);
+        kfree_rcu(table, rcu);
+}
+EXPORT_SYMBOL_GPL(devl_dpipe_table_unregister);
+
+/**
+ * devl_dpipe_table_resource_set - set the resource id
+ *
+ * @devlink: devlink
+ * @table_name: table name
+ * @resource_id: resource id
+ * @resource_units: number of resource's units consumed per table's entry
+ */
+int devl_dpipe_table_resource_set(struct devlink *devlink,
+                                  const char *table_name, u64 resource_id,
+                                  u64 resource_units)
+{
+        struct devlink_dpipe_table *table;
+
+        table = devlink_dpipe_table_find(&devlink->dpipe_table_list,
+                                         table_name, devlink);
+        if (!table)
+                return -EINVAL;
+
+        table->resource_id = resource_id;
+        table->resource_units = resource_units;
+        table->resource_valid = true;
+        return 0;
+}
+EXPORT_SYMBOL_GPL(devl_dpipe_table_resource_set);          

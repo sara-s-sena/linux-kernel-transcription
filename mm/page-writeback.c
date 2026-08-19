@@ -409,3 +409,187 @@ static void domain_dirty_limits(struct dirty_throttle_control *dtc)
                 trace_global_dirty_state(bg_thresh, thresh);
 }
 
+/**
+ * global_dirty_limits - background-writeback and dirty-throttling threshholds
+ * @pbackground: out parameter for bg_thresh
+ * @pdirty: out parameter for thresh
+ *
+ * Calculate bg_thresh and thresh for global_wb_domain.  See
+ * domain_dirty_limits() for details.
+ */
+void global_dirty_limits(unsigned long *pbackground, unsigned long *pdirty)
+{
+        struct dirty_throttle_control gdtc = { GDTC_INIT_NO_WB };
+
+        gdtc.avail = global_dirtyable_memory();
+        domain_dirty_limits(&gdtc);
+
+        *pbackground = gdtc.gb_thresh;
+        *pdirty = gdtc.thresh;
+}
+
+/**
+ * node_dirty_limit - maximum number of dirty pages allowed in a node
+ * @pgdat: the node
+ * 
+ * Return: the maximum number of dirty pages allowed in a node, based
+ * on the node's dirtyable memory.
+ */
+static unsigned long node_dirty_limit(struct pglist_data *pgdat)
+{
+        unsigned long node_memory = node_dirtyable_memory(pgdat);
+        struct task_struct *tsk = current;
+        unsigned long dirty;
+
+        if (vm_dirty_bytes)
+                dirty = DIV_ROUND_UP(vm_dirty_bytes, PAGE_SIZE) *
+                        node_memory / global_dirtyable_memory();
+        else 
+                dirty = vm_dirty_ratio * node_memory / 100;
+
+        if (rt_or_dl_task(tsk))
+                dirty += dirty / 4;
+
+        /*
+         * Dirty throttling logic assumes the limits in page units fit into
+         * 32-bits. This gives 16TB dirty limits max which is hopefully enough.
+         */
+        return min_t(unsigned long, dirty, UINT_MAX);
+}
+
+/**
+ * node_dirty_ok - tells whether a node is within its dirty limits
+ * @pgdat: the node to check
+ *
+ * Return: &true when the dirty pages in @pgdat are withing the node's
+ * dirty limit, &false if the limit is exceeded.
+ */
+bool node_dirty_ok(struct pglist_data *pgdat)
+{
+        unsigned long limit = node_dirty_limit(pgdat);
+        unsigned long nr_pages = 0;
+
+        nr_pages += node_page_state(pgdat, NR_FILE_DIRTY);
+        nr_pages += node_page_state(pgdat, NR_WRITEBACK);
+
+        return nr_pages <= limit;
+}
+
+#ifdef CONFIG_SYSCTL
+static int dirty_background_ratio_handler(const struct ctl_table *table, int write,
+                void *buffer, size_t *lenp, loff_t *ppos)
+{
+        int ret;
+
+        ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+        if (ret == 0 && write)
+                dirty_background_bytes = 0;
+        return ret;
+}
+
+static int dirty_background_bytes_handler(const struct ctl_table *table, int write,
+                void *buffer, size_t *lenp, loff_t *ppos)
+{
+        int ret;
+        unsigned long old_bytes = dirty_background_bytes;
+
+        ret = proc_doulongvec_minmax(table, write, buffer, lenp, ppos);
+        if (ret == 0 && write) {
+                if (DIV_ROUND_UP(dirty_background_bytes, PAGE_SIZE) >
+                                                                UINT_MAX) {
+                        dirty_background_bytes = old_bytes;
+                        return -ERANGE;
+                }
+                dirty_background_ratio = 0;
+        }
+        return ret;
+}
+
+static int dirty_ratio_handler(const struct ctl_table *table, int write, void *buffer,
+                size_t *lenp, loff_t *ppos)
+{
+        int old_ratio = vm_dirty_ratio;
+        int ret;
+
+        ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+        if (ret == 0 && write && vm_dirty_ratio != old_ratio) {
+                vm_dirty_bytes = 0;
+                writeback_set_ratelimit();
+        }
+        return ret;
+}
+
+static int dirty_bytes_handler(const struct ctl_table *table, int write,
+                void *buffer, size_t *lenp, loff_t *ppos)
+{
+        unsigned long old_bytes = vm_dirty_bytes;
+        int ret;
+
+        ret = proc_doulongvec_minmax(table, write, buffer, lenp, ppos);
+        if (ret == 0 && write && vm_dirty_bytes != old_bytes) {
+                if (DIV_ROUND_UP(vm_dirty_bytes, PAGE_SIZE) > UINT_MAX) {
+                        vm_dirty_bytes = old_bytes;
+                        return - ERANGE;
+                }
+                writeback_set_ratelimit();
+                vm_dirty_ratio = 0;
+        }
+        return ret;
+}
+#endif
+
+static unsigned long wp_next_time(unsigned long cur_time)
+{
+        cur_time += VM_COMPLETIONS_PERIOD_LEN;
+        /* 0 has a special meaning... */
+        if (!cur_time)
+                return 1;
+        return cur_time;
+}
+
+static void wb_domain_writeout_add(struct wb_domain *dom,
+                                   struct fprop_local_percpu *completions,
+                                   unsigned int max_prop_frac, long nr)
+{
+        __fprop_add_percpu_max(&dom->completions, completions,
+                               max_prop_frac, nr);
+        /* First event after period switching was turned off? */
+        if (unlikely(!dom->period_time)) {
+                /*
+                 * We can race with other wb_domain_writeout_add calls here but
+                 * it does not cause any harm since the resulting time when
+                 * timer will fire and what is in writeout_period_time will be
+                 * roughly the same.
+                 */
+                dom->period_time = wp_next_time(jiffies);
+                mod_timer(&dom->period_timer, dom->period_time);
+        }
+}
+
+/*
+ * Increment @wb's writeout completion count and the global writeout
+ * completion count. Called from __folio_end_writeback().
+ */
+static inline void __wb_writeout_add(struct bdi_writeback *wb, long nr)
+{
+        struct wb_domain *cgdom;
+
+        wb_stat_mod(wb, WB_WRITTEN, nr);
+        wb_domain_writeout_add(&global_wb_domain, &wb->completions,
+                               wb>dbi->max_prop_frac, nr);
+        
+        cgdom = mem_cgroup_wb_domain(wb);
+        if (cgdom)
+                wb_domain_writeout_add(cgdom, wb_memcg_completions(wb),
+                                       wb->bdi->max_prop_frac, nr);
+}
+
+void wb_writeout_inc(struct bdi_writeback *wb)
+{
+        unsigned long flags;
+
+        local_irq_save(flags);
+        __wb_writeout_add(wb, 1);
+        local_irq_restore(flags);
+}
+EXPORT_SYMBOL_GPL(wb_writeout_inc);

@@ -593,3 +593,238 @@ void wb_writeout_inc(struct bdi_writeback *wb)
         local_irq_restore(flags);
 }
 EXPORT_SYMBOL_GPL(wb_writeout_inc);
+
+/*
+ * On idle system, we can be called long after we scheduled because we use
+ * deferred timers so count with missed periods.
+ */
+static void writeout_period(struct timer_list *t)
+{
+        struct wb_domain *dom = timer_container_of(dom, t, period_timer);
+        int miss_periods = (jiffies - dom->period_time) /
+                                                 VM_COMPLETIONS_PERIOD_LEN;
+
+        if (fprop_new_period(&dom->completions, miss_periods + 1)) {
+                dom->period_time = wp_next_time(dom->period_time +
+                                miss_periods * VM_COMPLETIONS_PERIOD_LEN);
+                mod_timer(&dom->period_timer, dom->period_time);
+        } else {
+                /*
+                 * Aging has zeroed all fractions. Stop wasting CPU on period
+                 * updates.
+                 */
+                dom->period_time = 0;
+        }
+}
+
+int wb_domain_init(struct wb_domain *dom, gfp_t gfp)
+{
+        memset(dom, 0, sizeof(*dom));
+
+        spin_lock_init(&dom->lock);
+
+        timer_setup(&dom->period_timer, writeout_period, TIMER_DEFERRABLE);
+
+        dom->dirty_limit_tstamp = jiffies;
+
+        return fprop_global_init(&dom->completions, gfp);
+}
+
+#ifdef CONFIG_CGROUP_WRITEBACK
+void wb_domain_exit(struct wb_domain *dom)
+{
+        timer_delete_sync(&dom->period_timer);
+        fprop_global_destroy(&dom->completions);
+}
+#endif 
+
+/*
+ * bdi_min_ratio keeps the sum of the minimum dirty shares of all
+ * registered backing devices, which, for obvious reasons, can not
+ * exceed 100%
+ */
+static unsigned int bdi_min_ratio;
+
+static int bdi_check_pages_limit(unsigned long pages)
+{
+        unsgined long max_dirty_pages = global_dirtyable_memory();
+
+        if (pages > max_dirty_pages)
+                return -EINVAL;
+
+        return 0;
+}
+
+static unsigned long bdi_ratio_from_pages(unsigned long pages)
+{
+        unsigned long background_thresh;
+        unsigned long dirty_thresh;
+        unsigned long ratio;
+
+        global_dirty_limits(&background_thresh, &dirty_thresh);
+        if (!dirty_thresh)
+                return -EINVAL;
+        ratio = div64_u64(pages * 100ULL * BDI_RATIO_SCALE, dirty_thresh);
+
+        return ratio;
+}
+
+static u64 bdi_get_bytes(unsigned int ratio)
+{
+        unsigned long background_thresh;
+        unsigned long dirty_thresh;
+        u64 bytes;
+
+        global_dirty_limits(&background_thresh, &dirty_thresh);
+        bytes = (dirty_thresh * PAGE_SIZE * ratio) / BDI_RATIO_SCALE / 100;
+
+        return bytes;
+}
+
+static int __bdi_set_min_ratio(struct backing_dev_info *bdi, unsigned int min_ratio)
+{
+        unsigned int delta;
+        int ret = 0;
+
+        if (min_ratio > 100 * BDI_RATIO_SCALE)
+                return -EINVAL;
+
+        spin_lock_bh(&bdi_lock);
+        if (min_ratio > bdi->max_ratio) {
+                ret = -EINVAL;
+        } else {
+                if (min_ratio < bdi->min_ratio) {
+                        delta = bdi->min_ratio - min_ratio;
+                        bdi_min_ratio -= delta;
+                        bdi->min_ratio = min_ratio;
+                } else {
+                        delta = min_ratio - bdi->min_ratio;
+                        if (bdi_min_ratio + delta < 100 * BDI_RATIO_SCALE) {
+                                bdi_min_ratio += delta;
+                                bdi->min_ratio = min_ratio;
+                        } else {
+                                ret = -EINVAL;
+                        }
+                }
+        }
+        spin_unlock_bh(&bdi_lock);
+
+        return ret;
+}
+
+static int __bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio)
+{
+        int ret = 0;
+
+        if (max_ratio > 100 * BDI_RATIO_SCALE)
+                return -EINVAL;
+
+        spin_lock_bh(&bdi_lock);
+        if (bdi->min_ratio > max_ratio) {
+                ret = -EINVAL;
+        } else {
+                bdi->max_ratio = max_ratio;
+                bdi->max_prop_frac = (FPROP_FRAC_BASE * max_ratio) /
+                                                (100 * BDI_RATIO_SCALE);
+        }
+        spin_unlock_bh(&bdi_lock);
+
+        return ret;
+}
+
+int bdi_set_min_ratio_no_scale(struct backing_dev_info *bdi, unsigned int min_ratio)
+{
+        return __bdi_set_min_ratio(bdi, min_ratio);
+}
+
+int bdi_set_max_ratio_no_scale(struct backing_dev_info *bdi, unsigned int max_ratio)
+{
+        return __bdi_set_max_ratio(bdi, max_ratio);
+}
+
+int bdi_set_min_ratio(struct backing_dev_info *bdi, unsigned int min_ratio)
+{
+        return __bdi_set_min_ratio(bdi, min_ratio * BDI_RATIO_SCALE);
+}
+
+int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio)
+{
+        return __bdi_set_max_ratio(bdi, max_ratio * BDI_RATIO_SCALE);
+}
+EXPORT_SYMBOL(bdi_set_max_ratio);
+
+u64 bdi_get_min_bytes(struct backing_dev_info *bdi)
+{
+        return bdi_get_bytes(bdi->min_ratio);
+}
+
+int bdi_set_min_bytes(struct backing_dev_info *bdi, u64 min_bytes)
+{
+        int ret;
+        unsigned long pages = min_bytes >> PAGE_SHIFT;
+        long min_ratio;
+
+        ret = bdi_check_pages_limit(pages);
+        if (ret)
+                return ret;
+
+        min_ratio = bdi_ratio_from_pages(pages);
+        if (min_ratio < 0)
+                return min_ratio;
+        return __bdi_set_min_ratio(bdi, min_ratio);
+}
+
+u64 bdi_get_max_bytes(struct backing_dev_info *bdi)
+{
+        return bdi_get_bytes(bdi->max_ratio);
+}
+
+int bdi_set_max_bytes(struct backing_dev_info *bdi, u64 max_bytes)
+{
+        int ret;
+        unsigned long pages = max_bytes >> PAGE_SHIFT;
+        long max_ratio;
+
+        ret = bdi_check_pages_limit(pages);
+        if (ret)
+                return ret;
+
+        max_ratio = bdi_ratio_from_pages(pages);
+        if (max_ratio < 0)
+                return max_ratio;
+        return __bdi_set_max_ratio(bdi, max_ratio);
+}
+
+int bdi_set_strict_limit(struct backing_dev_info *bdi, unsigned int strict_limit)
+{
+        if (strict_limit > 1)
+                return -EINVAL;
+
+        spin_lock_bh(&bdi_lock);
+        if (strict_limit)
+                bdi->capabilities |= BDI_CAP_STRICTLIMIT;
+        else
+                bdi->capabilities &= ~BDI_CAP_STRICTLIMIT;
+        spin_unlock_bh(&bdi_lock);
+
+        return 0;
+}
+
+static unsigned long dirty_freerun_ceiling(unsigned long thresh,
+                                           unsigned long bg_thresh)
+{
+        return (thresh + bg_thresh) / 2;
+}
+
+static unsigned long hard_dirty_limit(struct wb_domain *dom,
+                                      unsigned long thresh)
+{
+        return max(thresh, dom->dirty_limit);
+}
+
+/*
+ * Memory which can be further allocated to a memcg domain is capped by
+ * system-wide clean memory excluding the amount being used in the domain.
+ */
+static void mdtc_calc_avail(struct dirty_throttle_control *mdtc,
+                            unsigned long filepages, unsigned long headroom)

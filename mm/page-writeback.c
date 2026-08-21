@@ -828,3 +828,159 @@ static unsigned long hard_dirty_limit(struct wb_domain *dom,
  */
 static void mdtc_calc_avail(struct dirty_throttle_control *mdtc,
                             unsigned long filepages, unsigned long headroom)
+{
+        struct dirty_throttle_control *gdtc = mdtc_gdtc(mdtc);
+        unsigned long clean = filepages - min(filepages, mdtc->dirty);
+        unsigned long global_clean = gdtc->avail - min(gdtc->avail, gdtc->dirty);
+        unsigned long other_clean = global_clean - min(global_clean, clean);
+
+        mdtc->avail = filepages + min(headroom, other_clean);
+}
+
+static inline bool dtc_is_global(struct dirty_throttle_control *dtc)
+{
+        return mdtc_gdtc(dtc) == NULL;
+}
+
+/*
+ * Dirty background will ignore pages being written as we're trying to
+ * decide whether to put more under writeback.
+ */
+static void domain_dirty_avail(struct dirty_throttle_control *dtc,
+                               bool include_writeback)
+{
+        if (dtc_is_global(dtc)) {
+                dtc->avail = global_dirtyable_memory();
+                dtc->dirty = global_node_page_state(NR_FILE_DIRTY);
+                if (include_writeback)
+                        dtc->dirty += global_node_page_state(NR_WRITEBACK);
+        } else {
+                unsigned long filepages = 0, headroom = 0, writeback = 0;
+
+                mem_cgroup_wb_stats(dtc->wb, &filepages, &headroom, &dtc->dirty,
+                                    &writeback);
+                if (include_writeback)
+                        dtc->dirty += writeback;
+                mdtc_calc_avail(dtc, filepages, headroom);
+        }
+}
+
+/**
+ * __wb_calc_thresh - @wb's share of dirty threshold
+ * @dtc: dirty_throttle_context of interest
+ * @thresh: dirty throttling or dirty background threshold of wb_domain in @dtc
+ *
+ * Note that balance_dirty_pages() will only seriously take dirty throttling
+ * threshold as a hard limit when sleeping max_pause per page is not enough
+ * to keep the dirty pages under control. For example, when the device is
+ * completely stalled due to some error conditions, or when there are 1000
+ * dd tasks writing to a slow 10MB/s USB key.
+ * In the other normal situations, it acts more gently by throttling the tasks
+ * more (rather than completely block them) when the wb dirty pages go high.
+ *
+ * It allocates high/low dirty limits to fast/slow devices, in order to prevent
+ * - starving fast devices
+ * - piling up dirty pages (that will take long time to sync) on slow devices
+ *
+ * The wb's share of dirty limit will be adapting to its throughput and
+ * bounded by the bdi->min_ratio and/or bdi->max_ratio parameters, if set.
+ *
+ * Return: @wb's dirty limit in pages. For dirty throttling limit, the term
+ * "dirty" in the context of dirty balacing includes all PG_dirty and
+ * PG_writeback pages.
+ */
+static unsigned long __wb_calc_thresh(struct dirty_throttle_control *dtc,
+                                      unsigned long thresh)
+{
+        struct wb_domain *dom = dtc_dom(dtc);
+        struct bdi_writeback *wb = dtc->wb;
+        u64 wb_thresh;
+        u64 wb_max_thresh;
+        unsigned long numerator, denominator;
+        unsigned long wb_min_ratio, wb_max_ratio;
+
+        /*
+         * Calculate this wb's share of the thresh ratio.
+         */
+        fprop_fraction_percpu(&dom->completions, dtc->wb_completions,
+                              &numerator, &denominator);
+        
+        wb_thresh = (thresh * (100 * BDI_RATIO_SCALE - bdi_min_ratio)) / (100 * BDI_RATIO_SCALE);
+        wb_thresh *= numerator;
+        wb_thresh = div64_ul(wb_thresh, denominator);
+
+        wb_min_max_ratio(wb, &wb_min_ratio, &wb_max_ratio);
+
+        wb_thresh += (thresh * wb_min_ratio) / (100 * BDI_RATIO_SCALE);
+
+        /*
+         * It's very possible that wb_thresh is close to 0 not because the
+         * device is slow, but that it has remained inactive for long time.
+         * Honour such devices a resonable good (hopefully IO efficient)
+         * threshold, so that the occasional writes won't be blocked and device
+         * writes can rampup the threshold quickly.
+         */
+        if (thresh > dtc->dirty) {
+                if (unlikely(wb->bdi->capabilities & BDI_CAP_STRICTLIMIT))
+                        wb_thresh = max(wb_thresh, (thresh - dtc->dirty) / 100);
+                else
+                        wb_thresh = max(wb_thresh, (thresh - dtc->dirty) / 8);
+        }
+
+        wb_max_thresh = thresh * wb_max_ratio / (100 * BDI_RATIO_SCALE);
+        if (wb_thresh > wb_max_thresh)
+                wb_thresh = wb_max_thresh;
+
+        return wb_thresh;
+}
+
+unsigned long wb_calc_thresh(struct bdi_writeback *wb, unsigned long thresh)
+{
+        struct dirty_throttle_control gdtc = { GDTC_INIT(wb) };
+
+        domain_dirty_avail(&gdtc, true);
+        return __wb_calc_thresh(&gdtc, thresh);
+}
+
+unsigned long cgwb_calc_thresh(struct bdi_writeback *wb)
+{
+        struct dirty_throttle_control gdtc = { GDTC_INIT_NO_WB };
+        struct dirty_throttle_control mdtc = { MDTC_INIT(wb, &gdtc) };
+
+        domain_dirty_avail(&gdtc, true);
+        domain_dirty_avail(&mdtc, true);
+        domain_dirty_limits(&mdtc);
+
+        return __wb_calc_thresh(&mdtc, mdtc.thresh);
+}
+
+/*
+ *                           setpoint - dirty 3
+ *        f(dirty) := 1.0 + (----------------)
+ *                           limit - setpoint
+ * 
+ * it's a 3rd order polynomial that subjects to
+ *
+ * (1) f(freerun)  = 2.0 => rampup dirty_ratelimit reasonably fast
+ * (2) f(setpoint) = 1.0 => the balance point
+ * (3) f(limit)    = 0   => the hard limit
+ * (4) df/dx      <= 0   => negative feedback control
+ * (5) the closer to setpoint, the smaller |df/dx| (and the reverse)
+ *     => fast response on large errors; small oscillation near setpoint
+ */
+static long long pos_ratio_polynom(unsigned long setpoint,
+                                          unsigned long dirty,
+                                          unsigned long limit)
+{
+        long long pos_ratio;
+        long x;
+
+        x = div64_s64(((s64)setpoint - (s64)dirty) << RATELIMIT_CALC_SHIFT,
+                      (limit - setpoint) | 1);
+        pos_ratio = x;
+        pos_ratio = pos_ratio * x >> RATELIMIT_CALC_SHIFT;
+        pos_ratio = pos_ratio * x >> RATELIMIT_CALC_SHIFT;
+        pos_ratio += 1 << RATELIMIT_CALC_SHIFT;
+
+        return clamp(pos_ratio, 0LL, 2LL << RATELIMIT_CALC_SHIFT);
+}

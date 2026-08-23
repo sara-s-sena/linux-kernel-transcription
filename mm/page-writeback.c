@@ -984,3 +984,131 @@ static long long pos_ratio_polynom(unsigned long setpoint,
 
         return clamp(pos_ratio, 0LL, 2LL << RATELIMIT_CALC_SHIFT);
 }
+
+/*
+ * Dirty position control.
+ *
+ * (o) global/bdi setpoints
+ *
+ * We want the dirty pages be balaced around the global/wb setpoints.
+ * When the number of dirty pages is higher/lower than the setpoint, the
+ * dirty position control ratio (and hence task dirty ratelimit) will be
+ * decreased/increased to bring the dirty pages back to the setpoint.
+ *
+ *     pos_ratio = 1 << RATELIMIT_CALC_SHIFT
+ * 
+ *     if (dirty < setpoint) scale up   pos_ratio
+ *     if (dirty > setpoint) scale down pos_ratio
+ *
+ *     if (wb_dirty < wb_setpoint) scale up   pos_ratio
+ *     if (wb_dirty > wb_setpoint) scale down pos_ratio
+ * 
+ *     task_ratelimit = dirty_ratelimit * pos_ratio >> RATELIMIT_CALC_SHIFT
+ *
+ * (o) global control line
+ *
+ *     ^ pos_ratio
+ *     |
+ *     |            |<===== global dirty control scope ======>|
+ * 2.0  * * * * * * * 
+ *     |            .*
+ *     |            . *
+ *     |            .   *
+ *     |            .     *
+ *     |            .        *
+ *     |            .            *
+ * 1.0 ................................*
+ *     |            .                  .      *
+ *     |            .                  .            *
+ *     |            .                  .               *
+ *     |            .                  .                  *
+ *     |            .                  .                    *
+ *   0 +------------.------------------.----------------------*------------>
+ *           freerun^          setpoint^                 limit^  dirty pages
+ *
+ * (o) wb control line
+ *
+ *     ^ pos_ratio
+ *     |
+ *     |            *
+ *     |              *
+ *     |                *
+ *     |                  *
+ *     |                    * |<=========== span ============>|
+ * 1.0 .......................*
+ *     |                      . *
+ *     |                      .   *
+ *     |                      .     *
+ *     |                      .       *
+ *     |                      .         *
+ *     |                      .           *
+ *     |                      .             *
+ *     |                      .               *
+ *     |                      .                 *
+ *     |                      .                   *
+ *     |                      .                     *
+ * 1/4 ...............................................* * * * * * * * * * * *
+ *     |                      .                         .
+ *     |                      .                           .
+ *     |                      .                             .
+ *   0 +----------------------.-------------------------------.------------->
+ *                wb_setpoint^                    x_intercept^
+ *
+ * The wb control line won't drop below pos_ratio=1/4, so that wb_dirty can
+ * be smoothly throttled down to normal if it starts high in situations like
+ * - start writing to a slow SD card and a fast disk at the same time. The SD
+ *   card's wb_dirty may rush to many times higher than wb_setpoint.
+ * - the wb dirty thresh drops quickly due to change of JBOD workload
+ */
+static void wb_position_ratio(struct dirty_throttle_control *dtc)
+{
+        struct bdi_writeback *wb = dtc->wb;
+        unsigned long write_bw = READ_ONCE(wb->avg_write_bandwidth);
+        unsigned long freerun = dirty_freerun_ceiling(dtc->thresh, dtc->bg_thresh);
+        unsigned long limit = dtc->limit = hard_dirty_limit(dtc_dom(dtc), dtc->thresh);
+        unsigned long wb_thresh = dtc->wb_thresh;
+        unsigned long x_intercept;
+        unsigned long setpoint;         /* dirty pages' target balance point */
+        unsigned long wb_setpoint;     
+        unsigned long span;
+        long long pos_ratio;            /* for scaling up/down the rate limit */
+        long x;
+
+        dtc->pos_ratio = 0;
+
+        if (unlikely(dtc->dirty >= limit))
+                return;
+
+        /*
+         * global setpoint
+         *
+         * See comment for pos_ratio_polynom(). 
+         */
+        setpoint = (freerun + limit) / 2;
+        pos_ratio = pos_ratio_polynom(setpoint, dtc->dirty, limit);
+
+        /*
+         * The strictlimit feature is a tool preventing mistrusted filesystems
+         * from growing a large number of dirty pages before throttling. For
+         * such filesystems balance_dirty_pages always checks wb counters
+         * against wb limits. Even if global "nr_dirty" is under "freerun".
+         * This is especially important for fuse which sets bdi->max_ratio to
+         * 1% by default.
+         *
+         * Here, in wb_position_ratio(), we calculate pos_ratio based on
+         * two values: wb_dirty and wb_thresh. Let's consider an example:
+         * total amount of RAM is 16GB, bdi->max_ratio is equal to 1%, global
+         * limits are set by default to 10% and 20% (background and throttle).
+         * Then wb_thresh is 1% of 20% of 16BG. This amounts to ~8K pages.
+         * wb_calc_thresh(wb, bg_thresh) is about ~4K pages. wb_setpoint is
+         * about ~6K pages (as the average of background and throttle wb
+         * limits). The 3rd order polynomial will provide positive feedback if
+         * wb_dirty is under wb_setpoint and vice versa.
+         *
+         * Note, that we cannot use global counters in these calculations
+         * because we want to throttle process writing to a strictlimit wb
+         * much earlier than global "freerun" is reached (~23MB vs. ~2.3GB
+         * in the example above).
+         */
+        
+}

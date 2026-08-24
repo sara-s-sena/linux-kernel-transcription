@@ -1110,5 +1110,306 @@ static void wb_position_ratio(struct dirty_throttle_control *dtc)
          * much earlier than global "freerun" is reached (~23MB vs. ~2.3GB
          * in the example above).
          */
+        if (unlikely (wb->bdi->capabilities & BDI_CAP_STRICTLIMIT)) {
+                long long wb_pos_ratio;
+
+                if (dtc->wb_dirty >= wb_thresh)
+                        return;
+
+                wb_setpoint = dirty_freerun_ceiling(wb_thresh,
+                                                    dtc->wb_bg_thresh);
+                
+                if (wb_setpoint == 0 || wb_setpoint == wb_thresh)
+                        return;
+
+                wb_pos_ratio = pos_ratio_polynom(wb_setpoint, dtc->wb_dirty,
+                                                 wb_thresh);
+
+                /*
+                 * Typically, for strictlimit case, wb_setpoint << setpoint
+                 * and pos_ratio >> wb_pos_ratio. In the other words global
+                 * state ("dirty") is not limiting factor and we have to
+                 * make decision based on wb counters. But there is an
+                 * important case when global pos_ratio should get precedence:
+                 * global limits are exceeded (e.g. due to activities on other
+                 * wb's) while given strictlimit wb is below limit.
+                 *
+                 * "pos_ratio * wb_pos_ratio" would work for the case above,
+                 * but it would look too non-natural for the case of all
+                 * activity in the system coming from a single strictlimit wb
+                 * with bdi->max_ratio == 100%.
+                 *
+                 * Note that min() below somewhat changes the dynamics of the
+                 * control system. Normally, pos_ratio value can be wll over 3
+                 * (when globally we are at freerun and wb is well below wb
+                 * setpoint). Now the maximum pos_ratio in the same situation
+                 * is 2. We might want to tweak this if we observe the control
+                 * system is too slow to adapt.
+                 */
+                dtc->pos_ratio = min(pos_ratio, wb_pos_ratio);
+                return;
+        }
+
+        /*
+         * We have computed basic pos_ratio above based on global situation. If
+         * the wb is over/under its share of dirty pages, we want to scale
+         * pos_ratio further down/up. That is done by the following mechanism.
+         */
+
+        /*
+         * wb setpoint
+         *
+         *        f(wb_dirty) := 1.0 + k * (wb_dirty - wb_setpoint)
+         *
+         *                        x_intercept - wb_dirty
+         *                     := --------------------------
+         *                        x_intercept - wb_setpoint
+         *              
+         * The main wb control line is a linear function that subjects to
+         *
+         * (1) f(wb_setpoint) = 1.0
+         * (2) k = - 1 / (8 * write_bw)  (in single wb case)
+         *     or equally: x_intercept = wb_setpoint + 8 * write_bw
+         *
+         * For single wb case, the dirty pages are observed to fluctuate
+         * regularly within range
+         *        [wb_setpoint - write_bw/2, wb_setpoint + write_bw/2]
+         * for various filesystems, where (2) can yield in a reasonable 12.5%
+         * fluctuation range for pos_ratio.
+         *
+         * For JBOD case, wb_thresh (not wb_dirty!) could fluctuate up to its
+         * own size, so move the slope over accordingly and choose a slope that
+         * yields 100% pos_ratio fluctuation on suddenly doubled wb_thresh. 
+         */
+        if (unlikely(wb_thresh > dtc->thresh))
+                wb_thresh = dtc->thresh;
+        /*
+         * scale global setpoint to wb's:
+         *      wb_setpoint = setpoint * wb_thresh / thresh
+         */
+        x = div_u64((u64)wb_thresh << 16, dtc->thresh | 1);
+        wb_setpoint = setpoint * (u64)x >> 16;
+        /*
+         * Use span=(8*write_bw) in single wb case as indicated by
+         * (thresh - wb_thresh ~= 0) and transit to wb_thresh in JBOD case.
+         *
+         *        wb_thresh                    thresh - wb_thresh
+         * span = --------- * (8 * write_bw) + ------------------ * wb_thresh
+         *         thresh                           thresh
+         */
+        span = (dtc->thresh - wb_thresh + 8 * write_bw) * (u64)x >> 16;
+        x_intercept = wb_setpoint + span;
+
+        if (dtc->wb_dirty < x_intercept - span / 4) {
+                pos_ratio = div64_u64(pos_ratio * (x_intercept - dtc->wb_dirty),
+                                      (x_intercept - wb_setpoint) | 1);
+        } else
+                pos_ratio /= 4;
         
+        /*
+         * wb reserve area, safeguard against dirty pool underrun and disk idle
+         * It may push the desired control point of global dirty pages higher
+         * than setpoint.
+         */
+        x_intercept = wb_thresh / 2;
+        if (dtc->wb_dirty < x_intercept) {
+                if (dtc->wb_dirty > x_intercept / 8)
+                        pos_ratio = div_u64(pos_ratio * x_intercept,
+                                            dtc->wb_dirty);
+                else
+                        pos_ratio *= 8;
+        }
+
+        dtc->pos_ratio = pos_ratio;
+}
+
+static void wb_update_write_bandwidth(struct bdi_writeback *wb,
+                                      unsigned long elapsed,
+                                      unsigned long written)
+{
+        const unsigned long period = roudup_pow_of_two(3 * HZ);
+        unsigned long avg = wb->avg_write_bandwidth;
+        unsigned long old = wb->write_bandwidth;
+        u64 bw;
+
+        /*
+         * bw = written * HZ / elapsed
+         *
+         *                   bw * elapsed + write_bandwidth * (period - elapsed)
+         * write_bandwidth = ---------------------------------------------------
+         *                                          period
+         *
+         * @written may have decreased due to folio_redirty_for_writepage().
+         * Avoid underflowing @bw calculation.
+         */
+        bw = written - min(written, wb->written_stamp);
+        bw *= HZ;
+        if (unlikely(elapsed > period)) {
+                bw = div64_ul(bw, elapsed);
+                avg = bw;
+                goto out;
+        }
+        bw += (u64)wb->write_bandwidth * (period - elapsed);
+        bw >>= ilog2(period);
+
+        /*
+         * one more level of smoothing, for filtering out sudden spikes
+         */
+        if (avg > old && old >= (unsigned long)bw)
+                avg -= (avg - old) >> 3;
+
+        if (avg < old && old <= (unsigned long)bw)
+                avg += (old - avg) >> 3;
+
+out:
+        /* keep avg > 0 to guarantee that tot > 0 if there are dirty wbs */
+        avg = max(avg, 1LU);
+        if (wb_has_dirty_io(wb)) {
+                long delta = avg - wb->avg_write_bandwidth;
+                WARN_ON_ONCE(atomic_long_add_return(delta,
+                                        &wb->bdi->tot_write_bandwidth) <= 0);
+        }
+        wb->write_bandwidth = bw;
+        WRITE_ONCE(wb->avg_write_bandwidth, avg);       
+}
+
+static void update_dirty_limit(struct dirty_throttle_control *dtc)
+{
+        struct wb_domain *dom = dtc_dom(dtc);
+        unsigned long thresh = dtc->thresh;
+        unsigned long limit = dom->dirty_limit;
+
+        /*
+         * Follow up in one step.
+         */
+        if (limit < thresh) {
+                limit = thresh;
+                goto update;
+        }
+
+        /*
+         * Follow down slowly. Use the higher one as the target, because thresh
+         * may drop below dirty. This is exactly the reason to introduce
+         * dom->dirty_limit which is guaranteed to lie above the dirty pages.
+         */
+        thresh = max(thresh, dtc->dirty);
+        if (limit > thresh) {
+                limit -= (limit - thresh) >> 5;
+                goto update;
+        }
+        return;
+update:
+        dom->dirty_limit = limit;
+}
+
+static void domain_update_dirty_limit(struct dirty_throttle_control *dtc,
+                                      unsigned long now)
+{
+        struct wb_domain *dom - dtc_dom(dtc);
+
+        /*
+         * check locklessly first to optimize away locking for the most time
+         */
+        if (time_before(now, dom->dirty_limit_tstamp + BANDWIDTH_INTERVAL))
+                return;
+
+        spin_lock(&dom->lock);
+        if (time_after_eq(now, dom->dirty_limit_tstamp + BANDWIDTH_INTERVAL)) {
+                update_dirty_limit(dtc);
+                dom->dirty_limit_tstamp = now;
+        }
+        spin_unlock(&dom->lock);
+}
+
+/*
+ * Maintain wb->dirty_ratelimit, the base dirty throttle rate.
+ *
+ * Normal wb tasks will be curbed at or below it in long term.
+ * Obviously it should be around (write_bw / N) when there are N add tasks.
+ */
+static void wb_update_dirty_ratelimit(struct dirty_throttle_control *dtc,
+                                      unsigned long dirtied,
+                                      unsigned long elapsed)
+{
+        struct bdi_writeback *wb = dtc->wb;
+        unsigned long dirty = dtc->dirty;
+        unsigned long freerun = dirty_freerun_ceiling(dtc->thresh, dtc->bg_thresh);
+        unsigned long limit = hard_dirty_limit(dtc_dom(dtc), dtc->thresh);
+        unsigned long setpoint = (freerun + limit) / 2;
+        unsigned long write_bw = wb->avg_write_bandwidth;
+        unsigned long dirty_ratelimit = wb->dirty_ratelimit;
+        unsigned long dirty_rate;
+        unsigned long task_ratelimit;
+        unsigned long balanced_dirty_ratelimit;
+        unsigned long step;
+        unsigned long x;
+        unsigned long shift;
+
+        /*
+         * The dirty rate will match the writeout rate in long term, except
+         * when dirty pages are truncated by userspace or re-dirtied by FS.
+         */
+        dirty_rate = (dirtied - wb->dirtied_stamp) * HZ / elapsed;
+
+        /*
+         * task_ratelimit reflects each dd's dirty rate for the past 200ms.
+         */
+        task_ratelimit = (u64)dirty_ratelimit *
+                                        dtc->pos_ratio >> RATELIMIT_CALC_SHIFT;
+        task_ratelimit++; /* it helps rampup dirty_ratelimit from tiny values */
+
+        /*
+         * A linear estimation of the "balanced" throttle rate. The theory is,
+         * if there are N dd tasks, each throttled at task_ratelimit, the wb's
+         * dirty_rate will be measured to be (N * task_ratelimit). So the below
+         * formula will yield the balanced rate limit (write_bw / N).
+         *
+         * Note that the expanded form is not a pure rate feedback:
+         *      rate_(i+1) = rate_(i) * (write_bw / dirty_rate)              (1)
+         * but also takes pos_ratio into account: 
+         *      rate_(i+1) = rate_(i) * (write_bw / dirty_rate) * pos_ratio  (2)
+         *
+         * (1) is not realistic because pos_ratio also takes part in balancing
+         * the dirty rate.  Consider the state
+         *      pos_ratio = 0.5                                              (3)
+         *      rate = 2 * (write_bw / N)                                    (4)
+         * If (1) is used, it will stuck in that state! Because each dd wil 
+         * be throttled at
+         *      task_ratelimit = pos_ratio * rate = (write_bw / N)           (5)
+         * yielding
+         *      dirty_rate = N * task_ratelimit = write_bw                   (6)
+         * put (6) into (1) we get 
+         *      rate_(i+1) = rate_(i)                                        (7)
+         *
+         * So we end up using (2) to always keep
+         *      rate_(i+1) ~= (write_bw / N)                                 (8)
+         * regardless of the value of pos_ratio. As long as (8) is satisfied,
+         * pos_ratio is able to drive itself to 1.0, which is not only where
+         * the dirty count meet the setpoint, but also where the slope of
+         * pos_ratio is most flat and hence task_ratelimit is least fluctuated.
+         */
+        balanced_dirty_ratelimit = div_u64((u64)task_ratelimit * write_bw,
+                                           dirty_rate | 1);
+        /*
+         * balanced_dirty_ratelimit ~= (write_bw / N) <= write_bw
+         */
+        if (unlikely(balanced_dirty_ratelimit > write_bw))
+                balanced_dirty_ratelimit = write_bw;
+
+        /*
+         * We could safely do this and return immediately:
+         *
+         *      wb->dirty_ratelimit = balanced_dirty_ratelimit;
+         *
+         * However to get a more stable dirty_ratelimit, the below elaborated
+         * code makes use of task_ratelimit to filter out singular points and
+         * limit the step size.
+         * 
+         * The below code essentially only uses the relative value of
+         *
+         *      task_ratelimit - dirty_ratelimit
+         *      = (pos_ratio - 1) * dirty_ratelimit
+         *
+         * which reflects the direction and size of dirty position error.
+         */
 }

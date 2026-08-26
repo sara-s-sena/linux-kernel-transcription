@@ -1582,3 +1582,163 @@ static unsigned long wb_max_pause(struct bdi_writeback *wb,
         return min_t(unsigned long, t, MAX_PAUSE);
 }
 
+static long wb_min_pause (struct bdi_writeback *wb,
+                          long max_pause,
+                          unsigned long task_ratelimit,
+                          unsigned long dirty_ratelimit,
+                          int *nr_dirtied_pause)
+{
+        long hi = ilog2(READ_ONCE(wb->avg_write_bandwidth));
+        long lo = ilog2(READ_ONCE(wb->dirty_ratelimit));
+        long t;         /* target pause */
+        long pause;     /* estimated next pause */
+        int pages;      /* target nr_dirtied_pause */
+
+        /* target for 10ms pause on 1-dd case */
+        t = max(1, HZ / 100);
+
+        /*
+         * Scale up pause time for concurrent dirtiers in order to reduce CPU
+         * overheads.
+         *
+         * (N * 10ms) on 2^N concurrent tasks.
+         */
+        if (hi > lo)
+                t += (hi - lo) * (10 * HZ) / 1024;
+
+        /*
+         * This is a bit convoluted. We try to base the next nr_dirtied_pause
+         * on the much more stable dirty_ratelimit. However the next pause time
+         * will be computed based on task_ratelimit and the two rate limits may
+         * depart considerably at some time. Especially if task_ratelimit goes
+         * below dirty_ratelimit/2 and the target pause is max_pause, the next
+         * pause time will be max_pause*2 _trimmed down_ to max_pause.  As a 
+         * result task_ratelimit won't be executed faithfully, which could
+         * eventually bring down dirty_ratelimit.
+         *
+         * We apply two rules to fix it up:
+         * 1) try to estimate the next pause time and if necessary, use a lower
+         *    nr_dirtied_pause so as not to exceed max_pause. When this happens,
+         *    nr_dirtied_pause will be "dancing" with task_ratelimit.
+         * 2) limit the target pause time to max_pause/2, so that the normal
+         *    small fluctuations of task_ratelimit won't trigger rule (1) and
+         *    nr_dirtied_pause will remain as stable as dirty_ratelimit.
+         */
+        t = min(t, 1 + max_pause / 2 );
+        pages = dirty_ratelimit * t / roundup_pow_of_two(HZ);
+
+        /*
+         * Tiny nr_dirtied_pause is found to hurt I/O performance in the test
+         * case fio-mmap-randwrite-64k, which does 16*{sync read, async write}.
+         * when the 16 consecutive reads are often interrupted by some dirty
+         * throttling pause during the async writes, cfq will go into idles
+         * (deadline is fine). So push nr_dirtied_pause as high as possible
+         * until reaches DIRTY_POLL_THRESH=32 pages.
+         */
+        if (pages < DIRTY_POLL_THRESH) {
+                t = max_pause;
+                pages = dirty_ratelimit * t / roundup_pow_of_two(HZ);
+                if (pages > DIRTY_POLL_THRESH) {
+                        pages = DIRTY_POLL_THRESH;
+                        t = HZ * DIRTY_POLL_THRESH / dirty_ratelimit;
+                }
+        }
+
+        pause = HZ * pages / (task_ratelimit + 1);
+        if (pause > max_pause) {
+                t = max_pause;
+                pages = task_ratelimit * t / roundup_pow_of_two(HZ);
+        }
+
+        *nr_dirtied_pause = pages;
+        /*
+         * The minimal pause time will normally be half the target pause time.
+         */
+        return pages >= DIRTY_POLL_THRESH ? 1 + t / 2 : t;
+}
+
+static inline void wb_dirty_limits(struct dirty_throttle_control *dtc)
+{
+        struct bdi_writeback *wb = dtc->wb;
+        unsigned long wb_reclaimable;
+
+        /*
+         * wb_thresh is not treated as some limiting factor as
+         * dirty_thresh, due to reasons
+         * - in JBOD setup, wb_thresh can fluctuate a lot
+         * - in a system with HDD and USB key, the USB key may somehow
+         *   go into state (wb_dirty >> wb_thresh) either because
+         *   wb_dirty starts high, or because wb_thresh drops low.
+         *   In this case we don't want to hard throttle the USB key
+         *   dirtiers for 100 seconds until wb_dirty drops under
+         *   wb_thresh. Instead the auxiliary wb control line in
+         *   wb_position_ratio() will let the dirtier task progress
+         *   at some rate <= (write_bw / 2) for bringing down wb_dirty.
+         */
+        dtc->wb_thresh = __wb_calc_thresh(dtc, dtc->thresh);
+        dtc->wb_bg_thresh = dtc->thresh ?
+                div_u64((u64)dtc->wb_thresh * dtc->bg_thresh, dtc->thresh) : 0;
+
+        /*
+         * In order to avoid the stacked BDI deadlock we need
+         * to ensure we accurately count the 'dirty' pages when
+         * the threshold is low.
+         *
+         * Otherwise it would be possible to get thresh+n pages
+         * reported dirty, even though there are thresh-m pages
+         * actually dirty; with m+n sitting in the percpu
+         * deltas.
+         */
+        if (dtc->wb_thresh < 2 * wb_stat_error()) {
+                wb_reclaimable = wb_stat_sum(wb, WB_RECLAIMABLE);
+                dtc->wb_dirty = wb_reclaimable + wb_stat_sum(wb, WB_WRITEBACK);
+        } else {
+                wb_reclaimable = wb_stat(wb, WB_RECLAIMABLE);
+                dtc->wb_dirty = wb_reclaimable + wb_stat(wb, WB_WRITEBACK);
+        }
+}
+
+static unsigned long domain_poll_intv(struct dirty_throttle_control *dtc,
+                                      bool strictlimit)
+{
+        unsigned long dirty, thresh;
+
+        if (strictlimit) {
+                dirty = dtc->wb_dirty;
+                thresh = dtc->wb_thresh;
+        } else {
+                dirty = dtc->dirty;
+                thresh = dtc->thresh;
+        }
+
+        return dirty_poll_interval(dirty, thresh);
+}
+
+/*
+ * Throttle it only when the background writeback cannot catch-up. This avoids
+ * (excessively) small writeouts when the wb limits are ramping up in case of
+ * !strictlimit.
+ *
+ * In strictlimit case make decision based on the wb counters and limits. Small
+ * writeouts when the wb limits are ramping up are the price we consciously pay
+ * for strictlimit-ing.
+ */
+static void domain_dirty_freerun(struct dirty_throttle_control *dtc,
+                                 bool strictlimit)
+{
+        unsigned long dirty, thresh, bg_thresh;
+
+        if (unlikely(strictlimit)) {
+                wb_dirty_limits(dtc);
+                dirty = dtc->wb_dirty;
+                thresh = dtc->wb_thresh;
+                bg_thresh = dtc->wb_bg_thresh;
+        } else {
+                dirty = dtc->dirty;
+                thresh = dtc->thresh;
+                bg_thresh = dtc->bg_thresh;
+        }
+        dtc->freerun = dirty <= dirty_freerun_ceiling(thresh, bg_thresh);
+}
+
+

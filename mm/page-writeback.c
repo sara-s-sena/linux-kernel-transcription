@@ -1741,4 +1741,198 @@ static void domain_dirty_freerun(struct dirty_throttle_control *dtc,
         dtc->freerun = dirty <= dirty_freerun_ceiling(thresh, bg_thresh);
 }
 
+static void balance_domain_limits(struct dirty_throttle_control *dtc,
+                                  bool strictlimit)
+{
+        domain_dirty_avail(dtc, true);
+        domain_dirty_limits(dtc);
+        domain_dirty_freerun(dtc, strictlimit);
+}
+
+static void wb_dirty_freerun(struct dirty_throttle_control *dtc,
+                             bool strictlimit)
+{
+        dtc->freerun = false;
+
+        /* was already handled in domain_dirty_freerun */
+        if (strictlimit)
+                return;
+
+        wb_dirty_limits(dtc);
+        /*
+         * LOCAL_THROTTLE tasks must not be throttled when below the per-wb
+         * freerun ceiling.
+         */
+        if (!(current->flags & PF_LOCAL_THROTTLE))
+                return;
+
+        dtc->freerun = dtc->wb_dirty <
+                       dirty_freerun_ceiling(dtc->wb_thresh, dtc->wb_bg_thresh);
+}
+
+static inline void wb_dirty_exceeded(struct dirty_throttle_control *dtc,
+                                     bool strictlimit)
+{
+        dtc->dirty_exceeded = (dtc->wb_dirty > dtc->wb_thresh) &&
+                ((dtc->dirty > dtc->thresh) || strictlimit);
+}
+
+/*
+ * The limits fields dirty_exceeded and pos_ratio won't be updated if wb is
+ * in freerun state. Please don't use there invalid fields in freerun case.
+ */
+static void balance_wb_limits(struct dirty_throttle_control *dtc,
+                              bool strictlimit)
+{
+        wb_dirty_freerun(dtc, strictlimit);
+        if (dtc->freerun)
+                return;
+
+        wb_dirty_exceeded(dtc, strictlimit);
+        wb_position_ratio(dtc);
+}
+
+/* 
+ * balance_dirty_pages() must be called by processes which are generating dirty
+ * data.  It looks at the number of dirty pages in the machine and will force
+ * the caller to wait once crossing the (background_thresh + dirty_thresh) / 2.
+ * If we're over `background_thresh` then the writeback threads are woken to
+ * perform some writeout.
+ */
+static int balance_dirty_pages(struct bdi_writeback *wb,
+                               unsigned long pages_dirtied, unsigned int flags)
+{
+        struct dirty_throttle_control gdtc_stor = { GDTC_INIT(wb) };
+        struct dirty_throttle_control mdtc_stor = { MDTC_INIT(wb, &gdtc_stor) };
+        struct dirty_throttle_control * const gdtc = &gdtc_stor;
+        struct dirty_throttle_control * const mdtc = mdtc_valid(&mdtc_stor) ?
+                                                     &mdtc_stor : NULL;
+        struct dirty_throttle_control *sdtc;
+        unsigned long nr_dirty;
+        long period;
+        long pause;
+        long max_pause;
+        long min_pause;
+        int nr_dirtied_pause;
+        unsigned long task_ratelimit;
+        unsigned long dirty_ratelimit;
+        struct backing_dev_info *bdi = wb->bdi;
+        bool strictlimit = bdi->capabilities & BDI_CAP_STRICTLIMIT;
+        unsigned long start_time = jiffies;
+        int ret = 0;
+
+        for (;;) {
+                unsigned long now = jiffies;
+
+                nr_dirty = global_node_page_state(NR_FILE_DIRTY);
+
+                balance_domain_limits(gdtc, strictlimit);
+                if (mdtc) {
+                        /*
+                         * If @wb belongs to !root memcg, repeat the same
+                         * basic calculations for the memcg domain.
+                         */
+                        balance_domain_limits(mdtc, strictlimit);
+                }
+
+                if (!writeback_in_progress(wb) &&
+                    (nr_dirty > gdtc->bg_thresh ||
+                     (strictlimit && gdtc->wb_dirty > gdtc->wb_bg_thresh)))
+                        wb_start_background_writeback(wb);
+                
+                /*
+                 * If memcg domain is in effect, @dirty should be under
+                 * both global and memcg freerun ceilings.
+                 */
+                if (gdtc->freerun && (!mdtc || mdtc->freerun)) {
+                        unsigned long intv;
+                        unsigned long m_intv;
+
+free_running:
+                        intv = domain_poll_intv(gdtc, strictlimit);
+                        m_intv = ULONG_MAX;
+
+                        current->dirty_paused_when = now;
+                        current->nr_dirtied = 0;
+                        if (mdtc)
+                                m_intv = domain_poll_intv(mdtc, strictlimit);
+                        current->nr_dirtied_pause = min(intv, m_intv);
+                        break;
+                }
+
+                /* 
+                 * Unconditionally start background writeback if it's not
+                 * already in progress. We need to do this because the global
+                 * dirty threshold check above (nr_dirty > gdtc->bg_thresh)
+                 * doesn't account for the memcg-based throttling case. memcg
+                 * uses its own dirty count and thresholds and can trigger
+                 * throttling even when global nr_dirty < gdtc->bg_thresh
+                 *
+                 * Writeback needs to be started else the writer stalls in the
+                 * throttle loop waiting for dirty pages to be written back
+                 * while no writeback is running.
+                 */
+                if (unlikely(!writeback_in_progress(wb)))
+                        wb_start_background_writeback(wb);
+
+                mem_cgroup_flush_foreign(wb);
+
+                /*
+                 * Calculate global domain's pos_ratio and select the
+                 * global dtc by default
+                 */
+                balance_wb_limits(gdtc, strictlimit);
+                if (gdtc->freerun)
+                        goto free_running;
+                sdtc = gdtc;
+
+                if (mdtc) {
+                        /*
+                         * If memcg domain is in effect, calculate its
+                         * pos_ratio.  @wb should satisfy constraints from
+                         * both global and memcg domains.  Choose the one
+                         * w/ lower pos_ratio.
+                         */
+                        balance_wb_limits(mdtc, strictlimit);
+                        if (mdtc->freerun)
+                                goto free_running;
+                        if (mdtc->pos_ratio < gdtc->pos_ratio)
+                                sdtc = mdtc;
+                }
+
+                wb->dirty_exceeded = gdtc->dirty_exceeded ||
+                                     (mdtc && mdtc->dirty_exceeded);
+                if (time_is_before_jiffied(READ_ONCE(wb->bw_time_stamp) +
+                                           BANDWIDTH_INTERVAL))
+                        __wb_update_bandwidth(gdtc, mdtc, true);
+
+                /* throttle according to the chosen dtc */
+                dirty_ratelimit = READ_ONCE(wb->dirty_ratelimit);
+                task_ratelimit = ((u64)dirty_ratelimit * sdtc->pos_ratio) >>
+                                                        RATELIMIT_CALC_SHIFT;
+                max_pause = wb_max_pause(wb, sdtc->wb_dirty);
+                min_pause = wb_min_pause(wb, max_pause,
+                                         task_ratelimit, dirty_ratelimit,
+                                         &nr_dirtied_pause);
+
+                if (unlikely(task_ratelimit == 0)) {
+                        period = max_pause;
+                        pause = max_pause;
+                        goto pause;
+                }
+                period = HZ * pages_dirtied / task_ratelimit;
+                pause = period;
+                if (current->dirty_paused_when)
+                        pause -= now - current->dirty_paused_when;
+                /* 
+                 * For less than 1s think time (ext3/4 mau block the dirtier
+                 * for up to 800ms from time to time on 1-HDD; so does xfs,
+                 * however at much less frequency), try to compensate it in
+                 * future periods by updating the virtual time; otherwise just
+                 * do a reset, as it may be a light dirtier.
+                 */
+                
+        }
+}
+
 

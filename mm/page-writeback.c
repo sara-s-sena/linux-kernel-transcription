@@ -1931,8 +1931,171 @@ free_running:
                  * future periods by updating the virtual time; otherwise just
                  * do a reset, as it may be a light dirtier.
                  */
-                
+                if (pause < min_pause) {
+                        trace_balance_dirty_pages(wb,
+                                                  sdtc,
+                                                  dirty_ratelimit,
+                                                  task_ratelimit,
+                                                  pages_dirtied,
+                                                  period,
+                                                  min(pause, 0L),
+                                                  start_time);
+                        if (pause < -HZ) {
+                                current->dirty_paused_when = now;
+                                current->nr_dirtied = 0;
+                        } else if (period) {
+                                current->dirty_paused_when += period;
+                                current->nr_dirtied = 0;
+                        } else if (current->nr_dirtied_pause <= pages_dirtied)
+                                current->nr_dirtied_pause += pages_dirtied;
+                        break;
+                }
+                if (unlikely(pause > max_pause)) {
+                        /* for occasional dropped task_ratelimit */
+                        now += min(pause - max_pause, max_pause);
+                        pause = max_pause;
+                }
+
+pause:
+                trace_balance_dirty_pages(wb,
+                                          sdtc,
+                                          dirty_ratelimit,
+                                          task_ratelimit,
+                                          pages_dirtied,
+                                          period,
+                                          pause,
+                                          start_time);
+                if (flags & BDP_ASYNC) {
+                        ret = -EAGAIN;
+                        break;
+                }
+                __set_current_state(TASK_KILLABLE);
+                bdi->last_bdp_sleep = jiffies;
+                io_schedule_timeour(pause);
+
+                current->dirty_paused_when = now + pause;
+                current->nr_dirtied = 0;
+                current->nr_dirtied_pause = nr_dirtied_pause;
+
+                /*
+                 * This is typically equal to (dirty < thresh) and can also
+                 * keep "1000+ dd on a slow USB stick" under control.
+                 */
+                if (task_ratelimit)
+                        break;
+
+                /*
+                 * In the case of an unresponsive NFS server and the NFS dirty
+                 * pages exceeds dirty_thresh, give the other good wb's a pipe
+                 * to go through, so that tasks on them still remain responsive.
+                 *
+                 * In theory 1 page is enough to keep the consumer-producer
+                 * pipe going: the flusher cleans 1 page => the task dirties 1
+                 * more page. However wb_dirty has accounting errors.  So use
+                 * the larger and more IO friendly wb_stat_error.
+                 */
+                if (sdtc->wb_dirty <= wb_stat_error())
+                        break;
+
+                if (fatal_signal_pending(current))
+                        break;
         }
+        return ret;
 }
+
+static DEFINE_PER_CPU(int, bdp_ratelimits);
+
+/*
+ * Normal tasks are throttled by
+ *      loop {
+ *              dirty tsk->nr_dirtied_pause pages;
+ *              take a snap in balance_dirty_pages();
+ *      }
+ * However there is a worst case. If every task exit immediately when dirtied
+ * (tsk->nr_dirtied_pause - 1) pages, balance_dirty_pages() will never be
+ * called to throttle the page dirties. The solution is to sabe the not yet
+ * throttled page dirties in dirty_throttle_leaks on task exit and charge them
+ * randomly into the running tasks. This works well for the above worst case,
+ * as the new task will pick up and accumulate the old task's leaked dirty
+ * count and eventually get throttled. 
+ */
+DEFINE_PER_CPU(int, dirty_throttle_leaks) = 0;
+
+/**
+ * balance_dirty_pages_ratelimit_flags - Balance dirty memory state.
+ * @mapping: address_space which was dirtied.
+ * @flags: BDP flags.
+ *
+ * Processes which are dirtying memory should call in here once for each page
+ * which was newly dirtied.  The function will periodically check the system's
+ * dirty state and will initiate writeback if needed.
+ *
+ * See balance_dirty_pages_ratelimited() for details.
+ *
+ * Return: If @flags contains BDP_ASYNC, it may return -EAGAIN to
+ * indicate that memory is out of balance and the caller must wait
+ * for I/O to complete.  Otherwise, it will return 0 to indicate
+ * that either memory was already in balance, or it was able to sleep
+ * until the amount of dirty memory returned to balance.
+ */
+int balance_dirty_pages_ratelimited_flags(struct address_space *mapping,
+                                        unsigned int flags)
+{
+        struct inode *inode = mapping->host;
+        struct backing_dev_info *bdi = inode_to_bdi(inode);
+        struct bdi_writeback *wb = NULL;
+        int ratelimit;
+        int ret = 0;
+        int *p;
+
+        if (!(bdi->capabilities & BDI_CAP_WRITEBACK))
+                return ret;
+
+        if (inode_cgwb_enabled(inode))
+                wb_get_create_current(bdi, GFP_KERNEL);
+        if (!wb)
+                wb = &bdi->wb;
+
+        ratelimit = current->nr_dirtied_pause;
+        if (wb->dirty_exceeded)
+                ratelimit = min(ratelimit, 32 >> (PAGE_SHIFT - 10));
+
+        preempt_disable();
+        /*
+         * This prevents one CPU to accumulate too many dirtied pages without
+         * calling into balance_dirty_pages(), which can happen when there are
+         * 1000+ tasks, all of them start dirtying pages at exactly the same
+         * time, hence all honoured too large initial task->nr_dirtied_pause.
+         */
+        p = this_cpu_ptr(&bdp_ratelimits);
+        if (unlikely(current->nr_dirtied >= ratelimit))
+                *p = 0;
+        else if (unlikely(*p >= ratelimit_pages)) {
+                *p = 0;
+                ratelimit = 0;
+        }
+        /*
+         * Pick up the dirtied pages by the exited tasks. This avoids lots of
+         * short-lived tasks (eg. gcc invocations in a kernel build) escaping
+         * the dirty throttling and livelock other long-run dirtiers.
+         */
+        p = this_cpu_ptr(&dirty_throttle_leaks);
+        if (*p > 0 && current->nr_dirtied < ratelimit) {
+                unsigned long nr_pages_dirtied;
+                nr_pages_dirtied = min(*p, ratelimit - current->nr_dirtied);
+                *p -= nr_pages_dirtied;
+                current->nr_dirtied += nr_pages_dirtied;
+        }
+        preempt_enable();
+
+        if (unlikely(current->nr_dirtied >= ratelimit))
+                ret = balance_dirty_pages(wb, current->nr_dirtied, flags);
+
+        wb_put(wb);
+        return ret;
+}
+EXPORT_SYMBOL_GPL(balance_dirty_pages_ratelimited_flags);
+
+
 
 

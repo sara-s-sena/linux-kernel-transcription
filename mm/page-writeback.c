@@ -2096,6 +2096,193 @@ int balance_dirty_pages_ratelimited_flags(struct address_space *mapping,
 }
 EXPORT_SYMBOL_GPL(balance_dirty_pages_ratelimited_flags);
 
+/**
+ * balance_dirty_pages_ratelimited - balance dirty memory state.
+ * @mapping: address_space which was dirtied.
+ *
+ * Processes which are dirtying memory should call in here once for each page
+ * which was newly dirtied.  The function will periodically check the system's
+ * dirty state and will initiate writeback if needed.
+ *
+ * Once we're over the dirty memory limit we decrease the ratelimiting
+ * by a lot, to prevent individual processes from overshooting the limit
+ * by (ratelimit_pages) each.
+ */
+void balance_dirty_pages_ratelimited(struct address_space *mapping)
+{
+        balance_dirty_pages_ratelimited_flags(mapping, 0);
+}
+EXPORT_SYMBOL(balance_dirty_pages_ratelimited);
+
+/*
+ * Similar to wb_dirty_limits, wb_bg_dirty_limits also calculates dirty
+ * and thresh, but it's for background writeback.
+ */
+static void wb_bg_dirty_limits(struct dirty_throttle_control *dtc)
+{
+        struct bdi_writeback *wb = dtc->wb;
+
+        dtc->wb_bg_thresh = __wb_calc_thresh(dtc, dtc->bg_thresh);
+        if (dtc->wb_bg_thresh < 2 * wb_stat_error())
+                dtc->wb_dirty = wb_stat_sum(wb, WB_RECLAIMABLE);
+        else
+                dtc->wb_dirty = wb_stat(wb, WB_RECLAIMABLE);
+}
+
+static bool domain_over_bg_thresh(struct dirty_throttle_control *dtc)
+{
+        domain_dirty_avail(dtc, false);
+        domain_dirty_limits(dtc);
+        if (dtc->dirty > dtc->bg_thresh)
+                return true;
+
+        wb_bg_dirty_limits(dtc);
+        if (dtc->wb_dirty > dtc->wb_bg_thresh)
+                return true;
+
+        return false;
+}
+
+/**
+ * wb_over_bg_thresh - does @wb need to be written back?
+ * @wb: bdi_writeback of interest
+ *
+ * Determines whether background writeback should keep writing @wb or it's
+ * clean enough.
+ *
+ * Return: %true if writeback should continue.
+ */
+bool wb_over_bg_thresh(struct bdi_writeback *wb)
+{
+        struct dirty_throttle_control gdtc = { GDTC_INIT(wb) };
+        struct dirty_throttle_control mdtc = { MDTC_INIT(wb, &gdtc) };
+
+        if (domain_over_bg_thresh(&gdtc))
+                return true;
+
+        if (mdtc_valid(&mdtc))
+                return domain_over_bg_thresh(&mdtc);
+
+        return false;
+}
+
+#ifdef CONFIG_SYSCTL
+/*
+ * sysctl handler for /proc/sys/vm/dirty_writeback_centisecs
+ */
+static int dirty_writeback_centisecs_handler(const struct ctl_table *table, int write,
+                void *buffer, size_t *length, loff_t *ppos)
+{
+        unsigned int old_interval = dirty_writeback_interval;
+        int ret;
+
+        ret = proc_dointvec(table, write, buffer, length, ppos);
+
+        /*
+         * Writing 0 to dirty_writeback_interval will disable periodic writeback
+         * and a different non-zero value will makeup the writeback threads.
+         * wb_makeup_delayed() would be more appropriate, but it's a pain to
+         * iterate over all bdis and wbs.
+         * The reason we do this is to make the change take effect immediately.
+         */
+        if (!ret && write && dirty_writeback_interval &&
+                dirty_writeback_interval != old_interval)
+                wakeup_flusher_threads(WB_REASON_PERIODIC);
+
+        return ret;
+}
+#endif
+
+/*
+ * If ratelimit_pages is too high then we can get into dirty_data overload
+ * if a large number of processes all perform writes at the same time.
+ *
+ * Here we set ratelimit_pages to a level which ensures that when all CPUs are
+ * dirtying in parallel, we cannot go more than 3% (1/32) over the dirty memory
+ * thresholds.
+ */
+
+void writeback_set_ratelimit(void)
+{
+        struct wb_domain *dom = &global_wb_domain;
+        unsigned long background_thresh;
+        unsigned long dirty_thresh;
+
+        global_dirty_limits(&background_thresh, &dirty_thresh);
+        dom->dirty_limit = dirty_thresh;
+        ratelimit_pages = dirty_thresh / (num_online_cpus() * 32);
+        if (ratelimit_pages < 16)
+                ratelimit_pages = 16;
+}
+
+static int page_writeback_cpu_online(unsigned int cpu)
+{
+        writeback_set_ratelimit();
+        return 0;
+}
+
+#ifdef CONFIG_SYSCTL
+
+static int laptop_mode;
+static int laptop_mode_handler(const struct ctl_table *table, int write,
+                               void *buffer, size_t *lenp, loff_t *ppos)
+{
+        int ret = proc_dointvec_jiffies(table, write, buffer, lenp, ppos);
+
+        if (!ret && write)
+                pr_warn("%s: vm.laptop_mode is deprecated. Ignoring setting.\n",
+                        current->comm);
+        
+        return ret;
+}
+
+/* this is needed for the proc_doulongvec_minmax of vm_dirty_bytes */
+static const unsigned long dirty_bytes_min = 2 * PAGE_SIZE;
+
+static const struct ctl_table vm_page_writeback_sysctls[] = {
+        {
+                .procname   = "dirty_background_ratio",
+                .data       = &dirty_background_ratio,
+                .maxlen     = sizeof(dirty_background_ratio),
+                .mode       = 0644,
+                .proc_handler   = dirty_background_ratio_handler,
+                .extra1     = SYSCTL_ZERO,
+                .extra2     = SYSCTL_ONE_HUNDRED,
+        },
+        {
+                .procname   = "dirty_background_bytes",
+                .data       = &dirty_background_bytes,
+                .maxlen     = sizeof(dirty_background_bytes),
+                .mode       = 0644,
+                .proc_handler   = dirty_background_bytes_handler,
+                .extra1     = SYSCTL_LONG_ONE,
+        },
+        {
+                .procname   = "dirty_ratio",
+                .data       = &vm_dirty_ratio,
+                .maxlen     = sizeof(vm_dirty_ratio),
+                .mode       = 0644,
+                .proc_handler   = dirty_ratio_handler,
+                .extra1     = SYSCTL_ZERO,
+                .extra2     = SYSCTL_ONE_HUNDRED,
+        },
+        {
+                .procname   = "dirty_bytes",
+                .data       = &vm_dirty_bytes,
+                .maxlen     = sizeof(vm_dirty_bytes),
+                .mode       = 0644,
+                .proc_handler   = dirty_bytes_handler,
+                .extra1     = (void *)&dirty_bytes_min,
+        },
+        {
+                .procname   = "dirty_writeback_centisecs",
+                .data       = &dirty_writeback_interval,
+                .maxlen     = sizeof(dirty_writeback_interval),
+                .mode       = 0644,
+                .proc_handler   = dirty_writeback_centisecs_handler,
+        },
+}
+
 
 
 

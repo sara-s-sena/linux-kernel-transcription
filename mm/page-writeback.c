@@ -2281,7 +2281,194 @@ static const struct ctl_table vm_page_writeback_sysctls[] = {
                 .mode       = 0644,
                 .proc_handler   = dirty_writeback_centisecs_handler,
         },
+        {
+                .procname   = "dirty_expire_centisecs",
+                .data       = &dirty_expire_interval,
+                .maxlen     = sizeof(dirty_expire_interval),
+                .mode       = 0644,
+                .proc_handler   = proc_dointvec_minmax,
+                .extra1     = SYSCTL_ZERO,
+        },
+#ifdef CONFIG_HIGHMEM
+        {
+                .procname       = "highmem_is_dirtyable",
+                .data           = &vm_highmem_is_dirtyable,
+                .maxlen         = sizeof(vm_highmem_is_dirtyable),
+                .mode           = 0644,
+                .proc_handler   = proc_dointvec_minmax,
+                .extra1         = SYSCTL_ZERO,
+                .extra2         = SYSCTL_ONE, 
+        },
+#endif
+        {
+                .procname       = "laptop_mode",
+                .data           = &laptop_mode,
+                .maxlen         = sizeof(laptop_mode),
+                .mode           = 0644,
+                .proc_handler   = laptop_mode_handler,
+        },        
+};
+#endif 
+
+/*
+ * Called early on to tune the page writeback dirty limits.
+ *
+ * We used to scale dirty pages according to how total memory
+ * related to pages that could be allocated for buffers.
+ *
+ * However, that was when we used "dirty_ratio" to scale with
+ * all memory, and we don't do that any more. "dirty_ratio"
+ * is now applied to total non-HIGHPAGE memory, and as such we can't
+ * get into the old insane situation any more where we had
+ * large amounts of dirty pages compared to a small amount of
+ * non-HIGHMEM memory.
+ *
+ * But we might still want to scale the dirty_ratio by how
+ * much memory the box has..
+ */
+void __init page_writeback_init(void)
+{
+        BUG_ON(wb_domain_init(&global_wb_domain, GFP_KERNEL));
+
+        cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "mm/writeback:online",
+                          page_writeback_cpu_online, NULL);
+        cpuhp_setup_state(CPUHP_MM_WRITEBACK_DEAD, "mm/writeback:dead", NULL,
+                          page_writeback_cpu_online);
+#ifdef CONFIG_SYSCTL
+        register_sysctl_init("vm", vm_page_writeback_sysctls);
+#endif
 }
+
+/**
+ * tag_pages_for_writeback - tag pages to be written by writeback
+ * @mapping: address space structure to write
+ * @start: starting page index
+ * @end: ending page index (inclusive)
+ *
+ * This function scans the page range from @start to @end (inclusive) and tags
+ * all pages that have DIRTY tag set with a special TOWRITE tag.  The caller
+ * can then use the TOWRITE tag to identify pages eligible for writeback.
+ * This mechanism is used to avoid livelocking of writeback by a process
+ * steadily creating new dirty pages in the file (thus it is important for this
+ * function to be quick so that it can tag pages faster than a dirtying process
+ * can create them).
+ */
+void tag_pages_for_writeback(struct address_space *mapping,
+                             pgoff_t start, pgoff_t end)
+{
+        XA_STATE(xas, &mapping->i_pages, start);
+        unsigned int tagged = 0;
+        void *page;
+
+        xas_lock_irq(&xas);
+        xas_for_each_marked(&xas, page, end, PAGECACHE_TAG_DIRTY) {
+                xas_set_mark(&xas, PAGECACHE_TAG_TOWRITE);
+                if (++tagged % XA_CHECK_SCHED)
+                        continue;
+
+                xas_pause(&xas);
+                xas_unlock_irq(&xas);
+                cond_resched();
+                xas_lock_irq(&xas);
+        }
+        xas_unlock_irq(&xas);
+}
+EXPORT_SYMBOL(tag_pages_for_writeback);
+
+static bool folio_prepare_writeback(struct address_space *mapping,
+                struct writeback_control *wbc, struct folio *folio)
+{
+        /*
+         * Folio truncated or invalidated. We can freely skip it then,
+         * even for data integrity operations: the folio has disappeared
+         * concurrently, so there could be no real expectation of this
+         * data integrity operation even if there is now a new, dirty
+         * folio at the same pagecache index.
+         */
+        if (unlikely(folio->mapping != mapping))
+                return false;
+
+        /*
+         * Did somebody else write it for us?
+         */
+        if (!folio_test_dirty(folio))
+                return false;
+
+        if (folio_test_writebak(folio)) {
+                if (wbc->sync_mode == WB_SYNC_NONE)
+                        return false;
+                folio_wait_writeback(folio);
+        }
+        BUG_ON(folio_test_writeback(folio));
+
+        if (!folio_clear_dirty_for_io(folio))
+                return false;
+
+        return true;
+}
+
+
+static pgoff_t wbc_end(struct writeback_control *wbc)
+{
+        if (wbc->range_cyclic)
+                return -1;
+        return wbc->range_end >> PAGE_SHIFT;
+}
+
+static struct folio *writeback_get_folio(struct address_space *mapping,
+                struct writeback_control *wbc)
+{
+        struct folio *folio;
+
+retry:
+        folio = folio_batch_next(&wbc->fbatch);
+        if (!folio) {
+                folio_batch_release(&wbc->fbatch);
+                cond_resched();
+                filemap_get_folios_tag(mapping, &wbc->index, wbc_end(wbc),
+                                wbc_to_tag(wbc), &wbc->fbatch);
+                folio = folio_batch_next(&wbc->fbatch);
+                if (!folio)
+                        return NULL;
+        }
+
+        folio_lock(folio);
+        if (unlikely(!folio_prepare_writeback(mapping, wbc, folio))) {
+                folio_unlock(folio);
+                goto retry;
+        }
+
+        trace_wbc_writepage(wbc, inode_to_bdi(mapping->host));
+        return folio;
+}
+
+/**
+ * writeback_iter - iterate folio of a mapping for writeback
+ * @mapping: address space structure to write
+ * @wbc: writeback context
+ * @folio: previously iterated folio (%NULL to start)
+ * @error: in-out pointer for writeback errors (see below)
+ *
+ * This function returns the next folio for the writeback operation described by
+ * @wbc on @mapping and should be called in a while loop in the ->writepages
+ * implementation.
+ * 
+ * To start the writeback operation, %NULL is passed in the @folio argument, and
+ * for every subsequent iteration for the folio returned previously should be passed
+ * back in.
+ * 
+ * If there was an error in the per-folio writeback inside the writeback_iter()
+ * loop, @error should be set to the error value.
+ *
+ * Once the writeback described in @wbc has finished, this function will return
+ * %NULL and if there was an error in any iteration restore it to @error.
+ * 
+ * Note: callers should not manually break out of the loop using break or goto
+ * but must keep calling writeback_iter() until it returns %NULL.
+ *
+ * Return: the folio to write or %NULL if the loop is done.
+ */
+
 
 
 

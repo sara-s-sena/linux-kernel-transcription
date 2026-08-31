@@ -2468,6 +2468,214 @@ retry:
  *
  * Return: the folio to write or %NULL if the loop is done.
  */
+struct folio *writeback_iter(struct address_space *mapping,
+                struct writeback_control *wbc, struct folio *folio, int *error)
+{
+        if (!folio) {
+                folio_batch_init(&wbc->fbatch);
+                wbc->saved_err = *error = 0;
+
+                /*
+                 * For range cyclic writeback we remember where we stopped so
+                 * that we can continue where we stopped.
+                 *
+                 * For non-cyclic writeback we always start at the beginning of
+                 * the passed in range.
+                 */
+                if (wbc->range_cyclic)
+                        wbc->index = mapping->writeback_index;
+                else
+                        wbc->index = wbc->range_start >> PAGE_SHIFT;
+
+                /*
+                 * To avoid livelocks when other processes dirty new pages, we
+                 * first tag pages which should be written back and only then
+                 * start writing them.
+                 *
+                 * For data-integrity writeback we have to be careful so that we
+                 * do not miss some pages (e.g., because some other process has
+                 * cleared the TOWRITE tag we set).  The rule we follow is that
+                 * TOWRITE tag can be cleared only by the process clearing the
+                 * DIRTY tag (and submitting the page for I/O).
+                 */
+                if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+                        tag_pages_for_writeback(mapping, wbc->index,
+                                        wbc_end(wbc));
+        } else {
+                wbc->nr_to_write -= folio_nr_pages(folio);
+
+                WARN_ON_ONCE(*error > 0);
+
+                /*
+                 * For integrity writeback we have to keep going until we have
+                 * written all the folios we tagged for writeback above, even if
+                 * we run past wbc->nr_to_write or encounter errors.
+                 * We stash away the first error we encounter in wbc->saved_err
+                 * so that it can be retrieved when we're done.  This is because
+                 * the file system may still have state to clear for each folio.
+                 *
+                 * For background writeback we exit as soon as we run past
+                 * wbc->nr_to_write or encounter the first error.
+                 */
+                if (wbc->sync_mode == WB_SYNC_ALL) {
+                        if (*error && !wbc->saved_err)
+                                wbc->saved_err = *error;
+                } else {
+                        if (*error || wbc->nr_to_write <= 0)
+                                goto done;
+                }
+        }
+
+        folio = writeback_get_folio(mapping, wbc);
+        if (!folio) {
+                /*
+                 * To avoid deadlocks between range_cyclic writeback and callers
+                 * that hold folios in writeback to aggregate I/O until
+                 * the writeback iteration finishes, we do not loop back to the
+                 * start of the file.  Doind so causes a folio lock/folio
+                 * writeback access order inversion - we should only ever lock
+                 * multiple folios in ascending folio->index order, and looping
+                 * back to the start of the file violates that rule and causes
+                 * deadlocks.
+                 */
+                if (wbc->range_cyclic)
+                        mapping->writeback_index = 0;
+
+                /*
+                 * Return the first error we encountered (if there was any) to
+                 * the caller
+                 */
+                *error = wbc->saved_err;
+        }
+        return folio;
+
+done:
+        if (wbc->range_cyclic)
+                mapping->writeback_index = folio_next_index(folio);
+        folio_batch_release(&wbc->fbatch);
+        return NULL;
+}
+EXPORT_SYMBOL_GPL(writeback_iter);
+
+int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
+{
+        int ret;
+        struct bdi_writeback *wb;
+
+        if (wbc->nr_to_write <= 0)
+                return 0;
+        wb = inode_to_wb_wbc(mapping->host, wbc);
+        wb_bandwidth_estimate_start(wb);
+        while (1) {
+                if (mapping->a_ops_writepages)
+                        ret = mapping->a_ops->writepages(mapping, wbc);
+                else
+                        /* deal with chardevs and other special files */
+                        ret = 0;
+                if (ret != -ENOMEM || wbc->sync_mode != WB_SYNC_ALL)
+                        break;
+
+                /*
+                 * Lacking an allocation context or the locality or writeback
+                 * state of any of the inode's pages, throttle based on
+                 * writeback activity on the local node. It's as good a
+                 * guess as any.
+                 */
+                reclaim_throttle(NODE_DATA(numa_node_id()),
+                        VMSCAN_THROTTLE_WRITEBACK);
+        }
+        /*
+         * Usually few pages are written by now from those we've just submitted
+         * but if there's constant writeback being submittes, this makes sure
+         * writeback bandwidth is update once in a while.
+         */
+        if (time_is_before_jiffies(READ_ONCE(wb->bw_time_stamp) +
+                                   BANDWIDTH_INTERVAL))
+                wb_update_bandwidth(wb);
+        return ret;
+}
+
+/*
+ * For address_spaces which do not use buffers nor write back.
+ */
+bool noop_dirty_folio(struct address_space *mapping, struct folio *folio)
+{
+        if (!folio_test_dirty(folio))
+                return !folio_test_set_dirty(folio);
+        return false;
+}
+EXPORT_SYMBOL(noop_dirty_folio);
+
+/*
+ * Helper function for set_page_dirty family.
+ *
+ * NOTE: This relies on being atomic wrt interrupts. 
+ */
+static void folio_account_dirtied(struct folio *folio,
+                struct address_space *mapping)
+{
+        struct inode *inode = mapping->host;
+
+        trace_writeback_dirty_folio(folio, mapping);
+
+        if (mapping_can_writeback(mapping)) {
+                struct bdi_writeback *wb;
+                long nr = folio_nr_pages(folio);
+
+                inode_attach_wb(inode, folio);
+                wb = inode_to_wb(inode);
+
+                lruvec_stat_mod_folio(folio, NR_FILE_DIRTY, nr);
+                __zone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, nr);
+                __node_stat_mode_folio(folio, NR_DIRTIED, nr);
+                wb_stat_mod(wb, WB_RECLAIMABLE, nr);
+                wb_stat_mod(wb, WB_DIRTIED, nr);
+                task_io_account_write(nr * PAGE_SIZE);
+                current->nr_dirtied += nr;
+                __this_cpu_add(bdp_ratelimits, nr);
+
+                mem_cgroup_track_foreign_dirty(folio, wb);
+        }
+}
+
+/*
+ * Helper function for deaccounting dirty page without writeback.
+ *
+ */
+void folio_account_cleaned(struct folio *folio, struct bdi_writeback *wb)
+{
+        long nr = folio_nr_pages(folio);
+
+        lruvec_stat_mod_folio(folio, NR_FILE_DIRTY, -nr);
+        zone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, -nr);
+        wb_stat_mod(wb, WB_RECLAIMABLE, -nr);
+        task_io_account_cancelled_write(nr * PAGE_SIZE);
+}
+
+/*
+ * Mark the folio dirty, and set it dirty in the page cache.
+ *
+ * If warn is true, then emit a warning if the folio is not uptodate and has
+ * not been truncated.
+ *
+ * It is the caller's responsibility to prevent the folio from being truncated
+ * while this function is in progress, although it may have been truncated
+ * before this function is called.  Most callers have the folio locked.
+ * A few have the folio blocked from the truncation through other means (e.g.
+ * zap_vma() has it mapped and is holding the page table lock).
+ * When called from mak_buffer_dirty(), the filesystem should hold a
+ * reference to the buffer_head that is being marked dirty, which causes
+ * try_to_free_buffers() to fail.
+ */
+void __folio_mark_dirty(struct folio *folio, struct address_space *mapping,
+                              int warn)
+{
+        unsigned long flags;
+
+        /*
+         *
+         */
+}
 
 
 

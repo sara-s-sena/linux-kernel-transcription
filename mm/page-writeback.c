@@ -2673,9 +2673,164 @@ void __folio_mark_dirty(struct folio *folio, struct address_space *mapping,
         unsigned long flags;
 
         /*
-         *
+         * Shem writeback relies on swap, and swap writeback is LRU based,
+         * not using the dirty mark.
          */
+        VM_WARN_ON_ONCE(folio_test_swapcache(folio) || shmem_mapping(mapping));
+
+        xa_lock_irqsave(&mapping->i_pages, flags);
+        if (folio->mapping) {   /* Race with truncate? */
+                WARN_ON_ONCE(warn && !folio_test_uptodate(folio));
+                folio_account_dirtied(folio, mapping);
+                __xa_set_mark(&mapping->i_pages, folio->index,
+                              PAGECACHE_TAG_DIRTY);
+        }
+        xa_unlock_irqrestore(&mapping->i_pages, flags);
 }
+
+/**
+ * filemap_dirty_folio - Mark a folio dirty for filesystems which do not use buffer_heads.
+ * @mapping: Address space this folio belongs to.
+ * @folio: Folio to be marked as dirty.
+ *
+ * Filesystems which do not use buffer heads should call this function
+ * from their dirty_folio address space operation.  It ignores the
+ * contents of folio_get_private(), so if the filesystem marks individual
+ * blocks as dirty, the filesystem should handle that itself.
+ *
+ * This is also sometimes used by filesystems which use buffer_heads when
+ * a single buffer is being dirtied: we want to set the folio dirty in
+ * that case, but not all the buffers.  This is a "buttom-up" dirtying,
+ * whereas block_dirty_folio() is a "top-down" dirtying.
+ *
+ * The caller must ensure this doesn't race with truncation.  Most will
+ * simply hold the folio lock, but e.g. zap_pte_range() calls with the
+ * folio mapped and the pte lock held, which also locks out truncation.
+ */
+bool filemap_dirty_folio(struct address_space *mapping, struct folio *folio)
+{
+        if (folio_test_set_dirty(folio))
+                return false;
+
+        __folio_mark_dirty(folio, mapping, !folio_test_private(folio));
+
+        if (mapping->host) {
+                /* !PageAnon && !swapper_space */
+                __mark_inode_dirty(mapping->host, I-DIRTY_PAGES);
+        }
+        return true;
+}
+EXPORT_SYMBOL(filemap_dirty_folio);
+
+/**
+ * folio_redirty_for_writepage - Decline to write a dirty folio.
+ * @wbc: The writeback control.
+ * @folio: The folio.
+ *
+ * When a writepage implementation decides that it doesn't want to write
+ * @folio for some reason, it should call this function, unlock @folio and
+ * return 0.
+ *
+ * Return: True if we redirtied the folio.  False if someone else dirtied
+ * it first.
+ */
+bool folio_redirty_for_writepage(struct writeback_control *wbc,
+                struct folio *folio)
+{
+        struct address_space *mapping = folio->mapping;
+        long nr = folio_nr_pages(folio);
+        bool ret;
+
+        wbc->pages_skipped += nr;
+        ret = filemap_dirty_folio(mapping, folio);
+        if (mapping && mapping_can_writeback(mapping)) {
+                struct inode *inode = mapping->host;
+                struct bdi_writeback *wb;
+                struct wb_lock_cookie cookie = {};
+
+                wb = unlocked_inode_to_wb_begin(inode, &cookie);
+                current->nr_dirtied -= nr;
+                node_stat_mod_folio(folio, NR_DIRTIED, -nr);
+                wb_stat_mod(wb, WB_DIRTIED, -nr);
+                unlocked_inode_to_wb_end(inode, &cookie);
+        }
+        return ret;
+}
+EXPORT_SYMBOL(folio_redirty_for_writepage);
+
+/**
+ * folio_mark_dirty - Mark a folio as being modified.
+ * @folio: The folio.
+ *
+ * The folio may not be truncated while this function is running.
+ * Holding the folio lock is sufficient to prevent truncation, but some
+ * callers cannot acquire a sleeping lock.  These callers instead hold
+ * the page table lock for a page table which contains at least one page
+ * in this folio.  Truncation will block on the page table lock as it
+ * unmaps pages before removing the folio from its mapping.
+ *
+ * Return: True is the folio was newly dirtied, false if it was already dirty.
+ */
+bool folio_mark_dirty(struct folio *folio)
+{
+        struct address_space *mapping = folio_mapping(folio);
+
+        if (likely(mapping)) {
+                /*
+                 * readahead/folio_deactivate could remain
+                 * PG_readahead/PG_reclaim due to race with folio_end_writeback
+                 * About readahead, if the folio is written, the flags would be
+                 * reset. So no problem.
+                 * About folio_deactivate, if the folio is redirtied,
+                 * the flag will be reset. So no problem. but if the
+                 * folio is used by readahead it will confuse readahead
+                 * and make it restart the size rampup process. But it's
+                 * a trivial problem.
+                 */
+                if (folio_test_reclaim(folio))
+                        folio_clear_reclaim(folio);
+                return mapping->a_ops->dirty_folio(mapping, folio);
+        }
+
+        return noop_dirty_folio(mapping, folio);
+}
+EXPORT_SYMBOL(folio_mark_dirty);
+
+/*
+ * folio_mark_dirty() is racy is the caller has no reference against
+ * folio->mapping->host, and if the folio is unlocked.  This is because another
+ * CPU could truncate the folio off the mapping and then free the mapping.
+ *
+ * Usually, the folio _is_ locked, or the caller is a user_space process which
+ * holds a reference on the inode by having an open file.
+ *
+ * In other cases, the folio should be locked before running folio_mark_dirty().
+ */
+bool folio_mark_dirty_lock(struct folio *folio)
+{
+        bool ret;
+
+        folio_lock(folio);
+        ret = folio_mark_dirty(folio);
+        folio_unlock(folio);
+        return ret;
+}
+EXPORT_SYMBOLL(folio_mark_dirty_lock);
+
+/*
+ * This cancels just the dirty bit on the kernel page itself, it does NOT
+ * actually remove dirty bits on any mmap's that may be around. It also
+ * leaves the page tagged dirty, so any sync activity will still find it on
+ * the dirty lists, and in particular, clear_page_dirty_for_io() will still
+ * look at the dirty bits in the VM.
+ *
+ * Doing this should *normally* only ever be done when a page is truncated,
+ * and is not actually mapped anywhere at all. However, fs/buffer.c does
+ * this when it notices that somebody has cleaned out all the buffers on a 
+ * page without actually doing it through the VM. Can you say "ext3 is
+ * horribly ugly"? Thought you could.
+ */
+
 
 
 

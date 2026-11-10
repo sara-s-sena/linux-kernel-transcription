@@ -301,4 +301,332 @@ int kmmio_handler(struct pt_regs *regs, unsigned long addr)
 
         if (ctx->probe && ctx->probe->pre_handler)
                 ctx->probe->pre_handler(ctx->probe, regs, addr);
+
+        /*
+         * Enable single-stepping and disable interrupts for the faulting
+         * context. Local interrupts must not get enabled during stepping.
+         */
+        regs->flags |= X86_EFLAGS_TF;
+        regs->flags &= ~X86_EFLAGS_IF;
+
+        /* Now we set present bit in PTE and single step. */
+        disarm_kmmio_fault_page(ctx->fpage);
+
+        /*
+         * If another cpu accesses the same page while we are stepping,
+         * the access will not be caught. It will simply succeed and the
+         * only downside is we lose the event. If this becomes a problem,
+         * the user should drop to single cpu before tracing.
+         */
+
+        return 1; /* fault handled */
+
+no_kmmio:
+        rcu_read_unlock_sched_notrace();
+        return ret;
+}
+
+/*
+ * Interrupts are disabled on entry as trap1 is an interrupt gate
+ * and they remain disabled throughout this function.
+ * This must always get called as the pair to kmmio_handler().
+ */
+static int post_kmmio_handler(unsigned long condition, struct pt_regs *regs)
+{
+        int ret = 0;
+        struct kmmio_context *ctx = this_cpu_ptr(&kmmio_ctx);
+
+        if (!ctx->active) {
+                /*
+                 * debug traps without an active context are due to either
+                 * something external causing them (f.e. using a debugger while
+                 * mmio tracing enabled), or erroneous behaviour
+                 */
+                pr_warn("unexpected debug trap on CPU %d.\n", smp_processor_id());
+                goto out;
+        }
+
+        if (ctx->probe && ctx->probe->post_handler)
+                ctx->probe->post_handler(ctx->probe, condition, regs);
+
+        /* Prevent racing against release_kmmio_fault_page(). */
+        arch_spin_lock(&kmmio_lock);
+        if (ctx->fpage->count)
+                arm_kmmio_fault_page(ctx->fpage);
+        arch_spin_unlock(&kmmio_lock);
+
+        regs->flags &= ~X86_EFLAGS_TF;
+        regs->flags |= ctx->saved_flags;
+
+        /* These were acquired in kmmio_handler(). */
+        ctx->active--;
+        BUG_ON(ctx->active);
+        rcu_read_unlock_sched_notrace();
+
+        /*
+         * if somebody else is singlestepping across a probe point, flags
+         * will have TF set,, in which case, continue the remaining processing
+         * of do_debug, as if this is not a probe hit.
+         */
+        if (!(regs->flags & X86_EFLAGS_TF))
+                ret = 1;
+out:
+        return ret;
+}
+
+/* You must be holding kmmio_lock. */
+static int add_kmmio_fault_page(unsigned long addr)
+{
+        struct kmmio_fault_page *f;
+
+        f = get_kmmio_fault_page(addr);
+        if (f) {
+                if (!f->count)
+                        arm_kmmio_fault_page(f);
+                f->count++;
+                return 0;
+        }
+
+        f = kzalloc_obj(*f, GFP_ATOMIC);
+        if (!f)
+                return -1;
+
+        f->count = 1;
+        f->addr = addr;
+
+        if (arm_kmmio_fault_page(f)) {
+                kfree(f);
+                return -1;
+        }
+
+        list_add_rcu(&f->list, kmmio_page_list(f->addr));
+
+        return 0;
+}
+
+/* You must be holding kmmio_lock. */
+static void release_kmmio_fault_page(unsigned long addr,
+                                struct kmmio_fault_page **release_list)
+{
+        struct kmmio_fault_page *f;
+
+        f = get_kmmio_fault_page(addr);
+        if (!f)
+                return;
+
+        f->count--;
+        BUG_ON(f->count < 0);
+        if (!f->count) {
+                disarm_kmmio_fault_page(f);
+                if (!f->scheduled_for_release) {
+                        f->release_next = *release_list;
+                        *release_list = f;
+                        f->scheduled_for_release = true;
+                }
+        }
+}
+
+/*
+ * With page-unaligned ioremaps, one or two armed pages may contain
+ * addresses from outside the intended mapping. Events for these addresses
+ * are currently silently dropped. The events may result only from programming
+ * mistakes by accessing addresses before the beginning or past the end of a
+ * mapping.
+ */
+int register_kmmio_probe(struct kmmio_probe *p)
+{
+        unsigned long flags;
+        int ret = 0;
+        unsigned long size = 0;
+        unsigned long addr = p->addr & PAGE_MASK;
+        const unsigned long size_lim = p->len + (p->addr & ~PAGE_MASK);
+        unsigned int l;
+        pte_t *pte;
+
+        local_irq_save(flags);
+        arch_spin_lock(&kmmio_lock);
+        if (get_kmmio_probe(addr)) {
+                ret = --EEXIST;
+                goto out;
+        }
+
+        pte = lookup_address(addr, &l);
+        if (!pte) {
+                ret = -EINVAL;
+                goto out;
+        }
+
+        kmmio_count++;
+        list_add_rcu(&p->list, &kmmio_probes);
+        while (size < size_lim) {
+                if (add_kmmio_fault_page(addr + size))
+                        pr_err("Unable to set page fault.\n");
+                size += page_level_size(l);
+        }
+out:
+        arch_spin_unlock(&kmmio_lock);
+        local_irq_restore(flags);
+
+        /*
+         * XXX: What should I do here?
+         * Here was a call to a global_flush_tlb(), but it does not exist
+         * anymore. It seems it's not needed after all.
+         */
+        return ret;
+}
+EXPORT_SYMBOL(register_kmmio_probe);
+
+static void rcu_free_kmmio_fault_pages(struct rcu_head *head)
+{
+        struct kmmio_delayed_release *dr = container_of(
+                                                head,
+                                                struct kmmio_delayed_release,
+                                                rcu);
+        struct kmmio_fault_page *f = dr->release_list;
+        while (f) {
+                struct kmmio_fault_page *next = f->release_next;
+                BUG_ON(f->count);
+                kfree(f);
+                f = next;
+        }
+        kfree(dr);
+}
+
+static void remove_kmmio_fault_pages(struct rcu_head *head)
+{
+        struct kmmio_delayed_release *dr =
+                container_of(head, struct kmmio_delayed_release, rcu);
+        struct kmmio_fault_page *f = dr->release_list;
+        struct kmmio_fault_page **prevp = &dr->release_list;
+        unsigned long flags;
+
+        local_irq_save(flags);
+        arch_spin_lock(&kmmio_lock);
+        while (f) {
+                if (!f->count) {
+                        list_del_rcu(&f->list);
+                        prevp = &f->release_next;
+                } else {
+                        *prevp = f->release_next;
+                        f->release_next = NULL;
+                        f->scheduled_for_release = false;
+                }
+                f = *prevp;
+        }
+        arch_spin_unlock(&kmmio_lock);
+        local_irq_restore(flags);
+
+        /* This is the real RCU destroy call. */
+        call_rcu(&dr->rcu, rcu_free_kmmio_fault_pages);
+}
+
+/*
+ * Remove a kmmio probe. You have to synchronize_rcu() before you can be
+ * sure that the callbacks will not be called anymore. Only after that
+ * you may actually release your struct kmmio_probe.
+ *
+ * Unregistering a kmmio fault page has three steps:
+ * 1. release_kmmio_fault_page()
+ *    Disarm the page, wait a grace period to let all faults finish.
+ * 2. remove kmmio_fault_pages()
+ *    Remove the pages from kmmio_page_table.
+ * 3. rcu_free_kmmio_fault_pages()
+ *    Actually free the kmmio_fault_page structs as with RCU.
+ */
+void unregister_kmmio_probe(struct kmmio_probe *p)
+{
+        unsigned long flags;
+        unsigned long size = 0;
+        unsigned long addr = p->addr & PAGE_MASK;
+        cost unsigned long size_lim = p->len + (p->addr & ~PAGE_MASK);
+        struct kmmio_fault_page *release_list = NULL;
+        struct kmmio_delayed_release *drelease;
+        unsigned int l;
+        pte_t *pte;
+
+        pte = lookup_address(addr, &l);
+        if (!pte)
+                return;
+
+        local_irq_save(flags);
+        arch_spin_lock(&kmmio_lock);
+        while (size < size_lim) {
+                release_kmmio_fault_page(addr + size, &release_list);
+                size += page_level_size(l);
+        }
+        list_del_rcu(&p->list);
+        kmmio_count--;
+        arch_spin_unlock(&kmmio_lock);
+        local_irq_restore(flags);
+
+        if (!release_list)
+                return;
+
+        drelease = kmalloc_obj(*drelease, GFP_ATOMIC);
+        if (!drelease) {
+                pr_crit("leaking kmmio_fault_page objects.\n");
+                return;
+        }
+        drelease->release_list = release_list;
+
+        /*
+         * This is not really RCU here. We have just disarmed a set of
+         * pages so that they cannot trigger page faults anymore. However,
+         * we cannot remove the pages from kmmio_page_table,
+         * because a probe hit might be in flight on another CPU. The
+         * pages are collected into a list, and they will be removed from
+         * kmmio_page_table when it is certain that no probe hit related to
+         * these pages can be in flight. RCU grace period sounds like a 
+         * good choice.
+         *
+         * If we removed the pages too early, kmmio page fault handler might
+         * not find the respective kmmio_fault_page and determine it's not
+         * a kmmio fault, when it actually is. This would lead to madness.
+         */
+        call_rcu(&drelease->rcu, remove_kmmio_fault_pages);
+}
+EXPORT_SYMBOL(unregister_kmmio_probe);
+
+static int
+kmmio_die_notifier(struct notifier_block *nb, unsigned long val, void *args)
+{
+        struct die_args *arg = args;
+        unsigned long* dr6_p = (unsigned long *)ERR_PTR(arg->err);
+
+        if (val == DIE_DEBUG && (*dr6_p & DR_STEP))
+                if (post_kmmio_handler(*dr6_p, arg->regs) == 1) {
+                        /*
+                         * Reset the BS bit in dr6 (pointed by args->err) to
+                         * denote completion of processing
+                         */
+                        *dr6_p &= ~DR_STEP;
+                        return NOTIFY_STOP;
+                }
+        
+        return NOTIFY_DONE;
+}
+
+static struct notifier_block nb_die = {
+        .notifier_call = kmmio_die_notifier
+};
+
+int kmmio_init(void)
+{
+        int i;
+
+        for (i = 0; i < KMMIO_PAGE_TABLE_SIZE; i++)
+                INIT_LIST_HEAD(&kmmio_page_table[i]);
+
+        return register_die_notifier(&nb_die);
+}
+
+void kmmio_cleanup(void)
+{
+        int i;
+
+        unregister_die_notifier(&nb_die);
+        for (i = 0; i < KMMIO_PAGE_TABLE_SIZE; i++) {
+                WARN_ONCE(!list_empty(&kmmio_page_table[i]),
+                        KERN_ERR "kmmio_page_table not empty at cleanup, any further tracing will leak memory.\n");
+        }
 }
